@@ -288,7 +288,7 @@ export const FRAUD_THRESHOLDS = {
 export const BLOCKED_CURRENCIES = ['CUP']; // Cuban Peso blocked due to no payment processor support
 
 // Default currency
-export const DEFAULT_CURRENCY = Currency.USD;
+export const DEFAULT_CURRENCY = 'USD' as const;
 
 // Supported locales
 export const SUPPORTED_LOCALES = [

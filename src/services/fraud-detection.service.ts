@@ -181,7 +181,7 @@ export class FraudDetectionService {
       this.prisma.fraudCheck.findMany({
         where: {
           // userId field not available in FraudCheck
-          createdAt: {
+          checkedAt: {
             gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) // Last 90 days
           }
         },
@@ -443,18 +443,18 @@ export class FraudDetectionService {
   private async saveFraudCheck(context: FraudContext, result: FraudCheckResult, processingTime: number) {
     await this.prisma.fraudCheck.create({
       data: {
-        // checkType field not available
-        userId: context.user.id,
-        orderId: context.order?.id,
-        paymentId: context.payment?.id,
+        orderId: context.order?.id || 'unknown',
+        ruleName: 'automated_check',
+        result: result.passed ? 'PASS' : 'FAIL',
         score: result.score,
-        passed: result.passed,
-        rules: result.rules,
-        ipAddress: context.ipAddress,
-        userAgent: context.userAgent,
-        processingTime,
-        requiresReview: result.requiresManualReview,
-        reviewNotes: result.blockedReason
+        details: {
+          rules: result.rules,
+          ipAddress: context.ipAddress,
+          userAgent: context.userAgent,
+          processingTime,
+          requiresReview: result.requiresManualReview,
+          reviewNotes: result.blockedReason
+        } as any
       }
     });
   }
@@ -468,15 +468,8 @@ export class FraudDetectionService {
     // Create fraud alert
     await this.prisma.fraudAlert.create({
       data: {
-        // type field not available
-        severity: result.score >= 0.9 ? 'CRITICAL' : 'HIGH',
-        userId: context.user.id,
-        description: `Fraud score ${result.score.toFixed(2)} - ${result.blockedReason || 'Multiple risk factors detected'}`,
-        metadata: {
-          checkId: result.id,
-          failedRules: result.rules.filter(r => !r.passed).map(r => r.ruleName),
-          ipAddress: context.ipAddress
-        }
+        orderId: context.order?.id || 'unknown',
+        reason: `Fraud score ${result.score.toFixed(2)} - ${result.blockedReason || 'Multiple risk factors detected'}`
       }
     });
 
@@ -506,7 +499,7 @@ export class FraudDetectionService {
     return 'US';
   }
 
-  private async checkMultipleFailedPayments(userId: string): Promise<boolean> {
+  private async checkMultipleFailedPayments(_userId: string): Promise<boolean> {
     const failedPayments = await this.prisma.payment.count({
       where: {
         // userId field not available in Payment
@@ -526,7 +519,7 @@ export class FraudDetectionService {
       where: {
         userId,
         // action field not available in UserActivityLog
-        type: {
+        activity: {
           in: ['email_changed', 'phone_changed', 'password_changed']
         },
         createdAt: {

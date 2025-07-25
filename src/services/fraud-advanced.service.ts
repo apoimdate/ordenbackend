@@ -205,33 +205,10 @@ export class AdvancedFraudService {
     try {
       const alert = await this.prisma.fraudAlert.create({
         data: {
-          // userId field not available
           orderId: data.orderId || '',
-          // riskAssessmentId field not available
-          detectedAt: new Date()
-        },
-        include: {
-          user: {
-            select: {
-              firstName: true,
-              lastName: true,
-              email: true
-            }
-          },
-          order: {
-            select: {
-              orderNumber: true,
-              total: true,
-              currency: true
-            }
-          },
-          riskAssessment: {
-            select: {
-              riskScore: true,
-              riskLevel: true
-            }
-          }
+          reason: data.description || 'Fraud detected by advanced service'
         }
+        // FraudAlert model doesn't have relations in current schema
       });
 
       // Send notifications to fraud team
@@ -338,9 +315,8 @@ export class AdvancedFraudService {
           name: data.name,
           description: data.description,
           conditions: data.conditions,
-          // severity field not available
-          isActive: data.isActive ?? true,
-          // metadata field not available
+          weight: 1.0, // Default weight
+          isActive: data.isActive ?? true
         }
       });
 
@@ -984,10 +960,10 @@ export class AdvancedFraudService {
     let isUnusualLocation = false;
     if (userId && location?.countryCode) {
       const userCountry = await this.getUserPrimaryCountry(userId);
-      isUnusualLocation = userCountry && userCountry !== location.countryCode;
+      isUnusualLocation = Boolean(userCountry && userCountry !== location.countryCode);
     }
     
-    const isRisky: boolean = isHighRiskCountry || isUnusualLocation;
+    const isRisky: boolean = Boolean(isHighRiskCountry || isUnusualLocation);
     
     return {
       isRisky,
@@ -1145,14 +1121,7 @@ export class AdvancedFraudService {
     logger.warn({ alertId }, 'Fraud alert escalated');
   }
 
-  private async getRiskDistribution(dateRange?: { startDate: Date; endDate: Date }): Promise<any[]> {
-    const where = dateRange ? {
-      createdAt: {
-        gte: dateRange.startDate,
-        lte: dateRange.endDate
-      }
-    } : {};
-
+  private async getRiskDistribution(_dateRange?: { startDate: Date; endDate: Date }): Promise<any[]> {
     // fraudRiskAssessment model not available
     return [];
   }

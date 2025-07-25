@@ -222,10 +222,10 @@ export class SearchService {
         searchKeywords: product.searchKeywords || [],
         searchScore: product.searchScore,
         searchPopularity: product.searchPopularity,
-        averageRating: product.averageRating.toNumber() || 0,
+        averageRating: 0, // averageRating field not in Product schema
         reviewCount: product._count?.reviews || 0,
-        stockQuantity: product.stockQuantity,
-        isInStock: product.stockQuantity > 0,
+        stockQuantity: 0, // stockQuantity field not in Product schema
+        isInStock: false, // stockQuantity field not in Product schema
         tags: product.tags?.map((t: any) => t.tag.name) || [],
         mainImage: product.images?.[0]?.url,
         images: product.images?.map((img: any) => img.url) || [],

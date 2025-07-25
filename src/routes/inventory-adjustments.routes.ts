@@ -45,9 +45,11 @@ export default async function inventoryAdjustmentsRoutes(
       },
     },
     async (request: CreateInventoryAdjustmentRequest, reply) => {
-      const inventoryAdjustment = await inventoryAdjustmentService.create(
-        request.body
-      );
+      const inventoryAdjustment = await inventoryAdjustmentService.create({
+        productId: request.body.productId,
+        change: request.body.quantity,
+        reason: request.body.reason
+      });
       reply.code(201).send(inventoryAdjustment);
     }
   );

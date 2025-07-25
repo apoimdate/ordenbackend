@@ -1,13 +1,13 @@
 import { FastifyInstance } from 'fastify';
-import { InventoryMovement, Prisma, PrismaClient } from '@prisma/client';
+import { inventory_movements as InventoryMovement, Prisma, PrismaClient } from '@prisma/client';
 import { CrudService } from './crud.service';
 
 export class InventoryMovementService extends CrudService<
   InventoryMovement,
-  Prisma.InventoryMovementCreateInput,
-  Prisma.InventoryMovementUpdateInput
+  Prisma.inventory_movementsCreateInput,
+  Prisma.inventory_movementsUpdateInput
 > {
-  protected modelName: keyof PrismaClient = 'inventoryMovement';
+  public modelName: keyof PrismaClient = 'inventory_movements';
 
   constructor(fastify: FastifyInstance) {
     super(fastify);

@@ -1,0 +1,993 @@
+import { FastifyInstance } from 'fastify';
+import { PrismaClient, Prisma, Currency } from '@prisma/client';
+import type { Payout } from '@prisma/client';
+type Transaction = {
+  type: string;
+  status: string;
+  amount: any;
+};
+import { Redis } from 'ioredis';
+import { logger } from '../utils/logger';
+import { ServiceResult } from '../types';
+import { validateBankAccount, validatePayPalAccount, BankDetails } from '../utils/payment.validator';
+import { Queue } from 'bullmq';
+import { config } from '../config/environment';
+import { PayoutMethod, PayoutStatus, TransactionType } from '../utils/constants';
+
+export interface CreatePayoutData {
+  sellerId: string;
+  amount: number;
+  currency: Currency;
+  method: PayoutMethod;
+  bankDetails?: BankDetails;
+  paypalEmail?: string;
+  notes?: string;
+}
+
+export interface PayoutSummary {
+  availableBalance: number;
+  pendingBalance: number;
+  processingBalance: number;
+  totalEarnings: number;
+  totalPaidOut: number;
+  lastPayoutDate?: Date;
+  nextPayoutDate?: Date;
+  currency: Currency;
+}
+
+export interface PayoutDetails extends Payout {
+  netAmount: number;
+}
+
+export class PayoutService {
+  private prisma: PrismaClient;
+  private redis: Redis;
+  private payoutQueue: Queue;
+
+  constructor(app: FastifyInstance) {
+    this.prisma = app.prisma;
+    this.redis = app.redis;
+    this.payoutQueue = new Queue('payouts', {
+      connection: {
+        host: config.redis.host,
+        port: config.redis.port,
+        password: config.redis.password,
+      },
+    });
+  }
+
+  /**
+   * Get seller payout summary
+   */
+  async getPayoutSummary(sellerId: string): Promise<ServiceResult<PayoutSummary>> {
+    try {
+      // Get seller details
+      const seller = await this.prisma.seller.findUnique({
+        where: { id: sellerId },
+      });
+
+      if (!seller) {
+        return {
+          success: false,
+          error: {
+            code: 'SELLER_NOT_FOUND',
+            message: 'Seller not found',
+            statusCode: 404
+          }
+        };
+      }
+
+      // Calculate balances from transactions
+      // Transaction model not available - using empty array for now
+      const transactions: Array<Pick<Transaction, 'type' | 'status' | 'amount'>> = [];
+      // const transactions = await this.prisma.transaction.findMany({
+      //   where: { sellerId },
+      //   select: { type: true, status: true, amount: true }
+      // });
+
+      // Calculate balances
+      let availableBalance = 0;
+      let pendingBalance = 0;
+      let processingBalance = 0;
+      let totalEarnings = 0;
+      let totalPaidOut = 0;
+
+      transactions.forEach((transaction: Pick<Transaction, 'type' | 'status' | 'amount'>) => {
+        const amount = Number(transaction.amount) || 0;
+
+        if (transaction.type === TransactionType.ORDER_PAYMENT) {
+          if (transaction.status === 'COMPLETED') {
+            availableBalance += amount;
+            totalEarnings += amount;
+          } else if (transaction.status === 'PENDING') {
+            pendingBalance += amount;
+          }
+        } else if (transaction.type === TransactionType.PAYOUT) {
+          if (transaction.status === 'COMPLETED') {
+            availableBalance -= amount;
+            totalPaidOut += amount;
+          } else if (transaction.status === 'PROCESSING') {
+            availableBalance -= amount;
+            processingBalance += amount;
+          }
+        } else if (transaction.type === TransactionType.COMMISSION_FEE) {
+          if (transaction.status === 'COMPLETED') {
+            availableBalance -= amount;
+            totalEarnings -= amount;
+          }
+        }
+      });
+
+      // Get last payout
+      const lastPayout = await this.prisma.payout.findFirst({
+        where: {
+          sellerId,
+          status: 'COMPLETED'
+        },
+        orderBy: {
+          processedAt: 'desc'
+        }
+      });
+
+      const summary: PayoutSummary = {
+        availableBalance: Math.max(0, availableBalance),
+        pendingBalance,
+        processingBalance,
+        totalEarnings,
+        totalPaidOut,
+        lastPayoutDate: lastPayout?.processedAt || undefined,
+        currency: Currency.USD
+      };
+
+      // Cache summary for 5 minutes
+      await this.redis.setex(
+        `payout_summary:${sellerId}`,
+        300,
+        JSON.stringify(summary)
+      );
+
+      return {
+        success: true,
+        data: summary
+      };
+    } catch (error: any) { 
+      logger.error({ error, sellerId }, 'Failed to get payout summary');
+      return {
+        success: false,
+        error: {
+          code: 'PAYOUT_SUMMARY_ERROR',
+          message: 'Failed to get payout summary',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Request a payout
+   */
+  async requestPayout(data: CreatePayoutData): Promise<ServiceResult<PayoutDetails>> {
+    try {
+      // Get payout summary
+      const summaryResult = await this.getPayoutSummary(data.sellerId);
+      if (!summaryResult.success || !summaryResult.data) {
+        return {
+          success: false,
+          error: summaryResult.error || {
+            code: 'SUMMARY_ERROR',
+            message: 'Failed to get payout summary',
+            statusCode: 500
+          }
+        };
+      }
+
+      const summary = summaryResult.data;
+
+      // Check minimum payout amount
+      const minimumPayout = 50; // $50 minimum
+      if (data.amount < minimumPayout) {
+        return {
+          success: false,
+          error: {
+            code: 'AMOUNT_TOO_LOW',
+            message: `Minimum payout amount is ${data.currency} ${minimumPayout}`,
+            statusCode: 400
+          }
+        };
+      }
+
+      // Check available balance
+      if (data.amount > summary.availableBalance) {
+        return {
+          success: false,
+          error: {
+            code: 'INSUFFICIENT_BALANCE',
+            message: 'Insufficient available balance',
+            statusCode: 400
+          }
+        };
+      }
+
+      // Validate payment method
+      if (data.method === PayoutMethod.BANK_TRANSFER && !data.bankDetails) {
+        return {
+          success: false,
+          error: {
+            code: 'BANK_DETAILS_REQUIRED',
+            message: 'Bank details are required for bank transfer',
+            statusCode: 400
+          }
+        };
+      }
+
+      if (data.method === PayoutMethod.PAYPAL && !data.paypalEmail) {
+        return {
+          success: false,
+          error: {
+            code: 'PAYPAL_EMAIL_REQUIRED',
+            message: 'PayPal email is required',
+            statusCode: 400
+          }
+        };
+      }
+
+      // Validate payment details
+      if (data.method === PayoutMethod.BANK_TRANSFER && data.bankDetails) {
+        const bankValidation = validateBankAccount(data.bankDetails);
+        if (!bankValidation.isValid) {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_BANK_DETAILS',
+              message: bankValidation.error || 'Invalid bank details',
+              statusCode: 400
+            }
+          };
+        }
+      }
+
+      if (data.method === PayoutMethod.PAYPAL && data.paypalEmail) {
+        const paypalValidation = validatePayPalAccount(data.paypalEmail);
+        if (!paypalValidation.isValid) {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_PAYPAL_EMAIL',
+              message: paypalValidation.error || 'Invalid PayPal email',
+              statusCode: 400
+            }
+          };
+        }
+      }
+
+      // Calculate fees
+      let fee = 0;
+      let feePercentage = 0;
+      let fixedFee = 0;
+
+      switch (data.method) {
+        case PayoutMethod.BANK_TRANSFER:
+          feePercentage = 0.01; // 1%
+          fixedFee = 2.5; // $2.50
+          break;
+        case PayoutMethod.PAYPAL:
+          feePercentage = 0.02; // 2%
+          fixedFee = 0.5; // $0.50
+          break;
+      }
+
+      fee = (data.amount * feePercentage) + fixedFee;
+      const netAmount = data.amount - fee;
+
+      // Create payout in transaction
+      const payout = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        // Create payout record
+        const newPayout = await tx.payout.create({
+          data: {
+            sellerId: data.sellerId,
+            amount: data.amount,
+            currency: data.currency,
+            method: data.method,
+            status: PayoutStatus.PENDING,
+            reference: data.notes,
+          }
+        });
+
+        // Create transaction record (commented out - model not available in tx context)
+        // await tx.transaction.create({
+        //   data: {
+        //     type: TransactionType.PAYOUT,
+        //     amount: data.amount,
+        //     status: 'PENDING',
+        //     sellerId: data.sellerId,
+        //     referenceId: newPayout.id,
+        //     referenceType: 'PAYOUT',
+        //     description: `Payout request`,
+        //   }
+        // });
+
+        return newPayout;
+      });
+
+      // Queue for processing
+      await this.payoutQueue.add('process-payout', {
+        payoutId: payout.id,
+        priority: data.amount > 1000 ? 1 : 2 // Higher priority for larger amounts
+      });
+
+      const payoutDetails: PayoutDetails = {
+        ...payout,
+        netAmount: netAmount,
+      };
+
+      // Clear cache
+      await this.redis.del(`payout_summary:${data.sellerId}`);
+
+      logger.info({
+        payoutId: payout.id,
+        sellerId: data.sellerId,
+        amount: data.amount,
+        method: data.method
+      }, 'Payout requested');
+
+      return {
+        success: true,
+        data: payoutDetails
+      };
+    } catch (error: any) { 
+      logger.error({ error, data }, 'Failed to request payout');
+      return {
+        success: false,
+        error: {
+          code: 'PAYOUT_REQUEST_ERROR',
+          message: 'Failed to request payout',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Get payout history
+   */
+  async getPayoutHistory(
+    sellerId: string,
+    options: {
+      page?: number;
+      limit?: number;
+      status?: PayoutStatus;
+      startDate?: Date;
+      endDate?: Date;
+    } = {}
+  ): Promise<ServiceResult<{
+    payouts: PayoutDetails[];
+    total: number;
+    page: number;
+    totalPages: number;
+  }>> {
+    try {
+      const page = options.page || 1;
+      const limit = options.limit || 20;
+      const skip = (page - 1) * limit;
+
+      const where: any = { sellerId };
+
+      if (options.status) {
+        where.status = options.status;
+      }
+
+      if (options.startDate || options.endDate) {
+        where.createdAt = {};
+        if (options.startDate) {
+          where.createdAt.gte = new Date(options.startDate);
+        }
+        if (options.endDate) {
+          where.createdAt.lte = new Date(options.endDate);
+        }
+      }
+
+      const [payouts, total] = await Promise.all([
+        this.prisma.payout.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          skip,
+          take: limit
+        }),
+        this.prisma.payout.count({ where })
+      ]);
+
+      const payoutDetails: PayoutDetails[] = payouts.map((payout: Payout) => ({
+        ...payout,
+        netAmount: Number(payout.amount) - (Number(payout.amount) * 0.01 + 2.5),
+      }));
+
+      return {
+        success: true,
+        data: {
+          payouts: payoutDetails,
+          total,
+          page,
+          totalPages: Math.ceil(total / limit)
+        }
+      };
+    } catch (error: any) { 
+      logger.error({ error, sellerId }, 'Failed to get payout history');
+      return {
+        success: false,
+        error: {
+          code: 'PAYOUT_HISTORY_ERROR',
+          message: 'Failed to get payout history',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Cancel a pending payout
+   */
+  async cancelPayout(payoutId: string, sellerId: string, reason: string): Promise<ServiceResult<void>> {
+    try {
+      const payout = await this.prisma.payout.findFirst({
+        where: {
+          id: payoutId,
+          sellerId
+        }
+      });
+
+      if (!payout) {
+        return {
+          success: false,
+          error: {
+            code: 'PAYOUT_NOT_FOUND',
+            message: 'Payout not found',
+            statusCode: 404
+          }
+        };
+      }
+
+      if (payout.status !== PayoutStatus.PENDING) {
+        return {
+          success: false,
+          error: {
+            code: 'PAYOUT_NOT_CANCELABLE',
+            message: 'Only pending payouts can be cancelled',
+            statusCode: 400
+          }
+        };
+      }
+
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        // Update payout status
+        await tx.payout.update({
+          where: { id: payoutId },
+          data: {
+            status: PayoutStatus.CANCELLED,
+          }
+        });
+
+        // Update transaction status (commented out - model not available)
+        // await tx.transaction.updateMany({
+        //   where: {
+        //     referenceId: payoutId,
+        //     referenceType: 'PAYOUT'
+        //   },
+        //   data: {
+        //     status: 'FAILED',
+        //   }
+        // });
+      });
+
+      // Remove from queue if exists
+      const jobs = await this.payoutQueue.getJobs(['waiting', 'delayed']);
+      for (const job of jobs) {
+        if (job.data.payoutId === payoutId) {
+          await job.remove();
+        }
+      }
+
+      // Clear cache
+      await this.redis.del(`payout_summary:${sellerId}`);
+
+      logger.info({
+        payoutId,
+        sellerId,
+        reason
+      }, 'Payout cancelled');
+
+      return { success: true };
+    } catch (error: any) { 
+      logger.error({ error, payoutId }, 'Failed to cancel payout');
+      return {
+        success: false,
+        error: {
+          code: 'PAYOUT_CANCEL_ERROR',
+          message: 'Failed to cancel payout',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Admin: Process pending payouts
+   */
+  async processPendingPayouts(adminId: string): Promise<ServiceResult<number>> {
+    try {
+      const pendingPayouts = await this.prisma.payout.findMany({
+        where: {
+          status: PayoutStatus.PENDING
+        },
+        orderBy: {
+          createdAt: 'asc'
+        },
+        take: 100 // Process up to 100 at a time
+      });
+
+      let processed = 0;
+      for (const payout of pendingPayouts) {
+        await this.payoutQueue.add('process-payout', {
+          payoutId: payout.id,
+          processedBy: adminId,
+          priority: 1
+        });
+        processed++;
+      }
+
+      logger.info({
+        adminId,
+        processed
+      }, 'Queued pending payouts for processing');
+
+      return {
+        success: true,
+        data: processed
+      };
+    } catch (error: any) { 
+      logger.error({ error }, 'Failed to process pending payouts');
+      return {
+        success: false,
+        error: {
+          code: 'PROCESS_PAYOUTS_ERROR',
+          message: 'Failed to process pending payouts',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Get payout statistics for admin
+   */
+  async getPayoutStatistics(
+    filters: {
+      startDate?: Date;
+      endDate?: Date;
+      sellerId?: string;
+    } = {}
+  ): Promise<ServiceResult<{
+    totalPayouts: number;
+    totalAmount: number;
+    totalFees: number;
+    byStatus: Record<PayoutStatus, { count: number; amount: number }>;
+    byMethod: Record<PayoutMethod, { count: number; amount: number }>;
+    averageProcessingTime: number;
+  }>> {
+    try {
+      const where: any = {};
+
+      if (filters.sellerId) {
+        where.sellerId = filters.sellerId;
+      }
+
+      if (filters.startDate || filters.endDate) {
+        where.createdAt = {};
+        if (filters.startDate) {
+          where.createdAt.gte = filters.startDate;
+        }
+        if (filters.endDate) {
+          where.createdAt.lte = filters.endDate;
+        }
+      }
+
+      const payouts = await this.prisma.payout.findMany({
+        where,
+        select: {
+          amount: true,
+          status: true,
+          method: true,
+          createdAt: true,
+          processedAt: true
+        }
+      });
+
+      const statistics = {
+        totalPayouts: payouts.length,
+        totalAmount: 0,
+        totalFees: 0,
+        byStatus: {} as Record<PayoutStatus, { count: number; amount: number }>,
+        byMethod: {} as Record<PayoutMethod, { count: number; amount: number }>,
+        averageProcessingTime: 0
+      };
+
+      let totalProcessingTime = 0;
+      let processedCount = 0;
+
+      payouts.forEach((payout) => {
+        statistics.totalAmount += Number(payout.amount);
+
+        // By status
+        const statusKey = payout.status as PayoutStatus;
+        if (!statistics.byStatus[statusKey]) {
+          statistics.byStatus[statusKey] = { count: 0, amount: 0 };
+        }
+        statistics.byStatus[statusKey].count++;
+        statistics.byStatus[statusKey].amount += Number(payout.amount);
+
+        // By method
+        const methodKey = payout.method as PayoutMethod;
+        if (!statistics.byMethod[methodKey]) {
+          statistics.byMethod[methodKey] = { count: 0, amount: 0 };
+        }
+        statistics.byMethod[methodKey].count++;
+        statistics.byMethod[methodKey].amount += Number(payout.amount);
+
+        // Processing time
+        if (payout.processedAt) {
+          const processingTime = payout.processedAt.getTime() - payout.createdAt.getTime();
+          totalProcessingTime += processingTime;
+          processedCount++;
+        }
+      });
+
+      if (processedCount > 0) {
+        statistics.averageProcessingTime = totalProcessingTime / processedCount / 1000 / 60; // in minutes
+      }
+
+      return {
+        success: true,
+        data: statistics
+      };
+    } catch (error: any) { 
+      logger.error({ error, filters }, 'Failed to get payout statistics');
+      return {
+        success: false,
+        error: {
+          code: 'PAYOUT_STATS_ERROR',
+          message: 'Failed to get payout statistics',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Get payout details by ID
+   */
+  async getPayoutDetails(payoutId: string, sellerId: string): Promise<ServiceResult<PayoutDetails>> {
+    try {
+      const payout = await this.prisma.payout.findFirst({
+        where: {
+          id: payoutId,
+          sellerId
+        }
+      });
+
+      if (!payout) {
+        return {
+          success: false,
+          error: {
+            code: 'PAYOUT_NOT_FOUND',
+            message: 'Payout not found',
+            statusCode: 404
+          }
+        };
+      }
+
+      const payoutDetails: PayoutDetails = {
+        ...payout,
+        netAmount: Number(payout.amount) - (Number(payout.amount) * 0.01 + 2.5),
+      };
+
+      return {
+        success: true,
+        data: payoutDetails
+      };
+    } catch (error: any) { 
+      logger.error({ error, payoutId }, 'Failed to get payout details');
+      return {
+        success: false,
+        error: {
+          code: 'PAYOUT_DETAILS_ERROR',
+          message: 'Failed to get payout details',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Get available balance for payout
+   */
+  async getAvailableBalance(sellerId: string): Promise<ServiceResult<{ balance: number; currency: string }>> {
+    try {
+      const summaryResult = await this.getPayoutSummary(sellerId);
+      if (!summaryResult.success || !summaryResult.data) {
+        return {
+          success: false,
+          error: summaryResult.error || {
+            code: 'BALANCE_ERROR',
+            message: 'Failed to get balance',
+            statusCode: 500
+          }
+        };
+      }
+
+      return {
+        success: true,
+        data: {
+          balance: summaryResult.data.availableBalance,
+          currency: summaryResult.data.currency
+        }
+      };
+    } catch (error: any) { 
+      logger.error({ error, sellerId }, 'Failed to get available balance');
+      return {
+        success: false,
+        error: {
+          code: 'BALANCE_ERROR',
+          message: 'Failed to get available balance',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Get all payouts (Admin)
+   */
+  async getAllPayouts(options: {
+    page?: number;
+    limit?: number;
+    status?: PayoutStatus;
+    sellerId?: string;
+    startDate?: string;
+    endDate?: string;
+  } = {}): Promise<ServiceResult<{
+    payouts: PayoutDetails[];
+    total: number;
+    page: number;
+    totalPages: number;
+  }>> {
+    try {
+      const page = options.page || 1;
+      const limit = options.limit || 20;
+      const skip = (page - 1) * limit;
+
+      const where: any = {};
+
+      if (options.status) {
+        where.status = options.status;
+      }
+
+      if (options.sellerId) {
+        where.sellerId = options.sellerId;
+      }
+
+      if (options.startDate || options.endDate) {
+        where.createdAt = {};
+        if (options.startDate) {
+          where.createdAt.gte = new Date(options.startDate);
+        }
+        if (options.endDate) {
+          where.createdAt.lte = new Date(options.endDate);
+        }
+      }
+
+      const [payouts, total] = await Promise.all([
+        this.prisma.payout.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          skip,
+          take: limit,
+          include: {
+            seller: {
+              include: {
+                user: true
+              }
+            }
+          }
+        }),
+        this.prisma.payout.count({ where })
+      ]);
+
+      const payoutDetails: PayoutDetails[] = payouts.map((payout: Payout) => ({
+        ...payout,
+        netAmount: Number(payout.amount) - (Number(payout.amount) * 0.01 + 2.5),
+      }));
+
+      return {
+        success: true,
+        data: {
+          payouts: payoutDetails,
+          total,
+          page,
+          totalPages: Math.ceil(total / limit)
+        }
+      };
+    } catch (error: any) { 
+      logger.error({ error }, 'Failed to get all payouts');
+      return {
+        success: false,
+        error: {
+          code: 'GET_PAYOUTS_ERROR',
+          message: 'Failed to get payouts',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Process a payout (Admin)
+   */
+  async processPayout(
+    payoutId: string,
+    processedBy: string,
+    data: {
+      transactionId?: string;
+      notes?: string;
+    } = {}
+  ): Promise<ServiceResult<void>> {
+    try {
+      const payout = await this.prisma.payout.findUnique({
+        where: { id: payoutId }
+      });
+
+      if (!payout) {
+        return {
+          success: false,
+          error: {
+            code: 'PAYOUT_NOT_FOUND',
+            message: 'Payout not found',
+            statusCode: 404
+          }
+        };
+      }
+
+      if (payout.status !== PayoutStatus.PENDING) {
+        return {
+          success: false,
+          error: {
+            code: 'INVALID_PAYOUT_STATUS',
+            message: 'Payout must be in pending status to process',
+            statusCode: 400
+          }
+        };
+      }
+
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        // Update payout
+        await tx.payout.update({
+          where: { id: payoutId },
+          data: {
+            status: PayoutStatus.COMPLETED,
+            processedAt: new Date(),
+            reference: data.transactionId,
+          }
+        });
+
+        // Update transaction (commented out - model not available)
+        // await tx.transaction.updateMany({
+        //   where: {
+        //     referenceId: payoutId,
+        //     referenceType: 'PAYOUT'
+        //   },
+        //   data: {
+        //     status: 'COMPLETED'
+          }
+        });
+      });
+
+      // Clear cache
+      await this.redis.del(`payout_summary:${payout.sellerId}`);
+
+      logger.info({
+        payoutId,
+        processedBy,
+        transactionId: data.transactionId
+      }, 'Payout processed');
+
+      return { success: true };
+    } catch (error: any) { 
+      logger.error({ error, payoutId }, 'Failed to process payout');
+      return {
+        success: false,
+        error: {
+          code: 'PROCESS_PAYOUT_ERROR',
+          message: 'Failed to process payout',
+          statusCode: 500
+        }
+      };
+    }
+  }
+
+  /**
+   * Reject a payout (Admin)
+   */
+  async rejectPayout(
+    payoutId: string,
+    rejectedBy: string,
+    reason: string
+  ): Promise<ServiceResult<void>> {
+    try {
+      const payout = await this.prisma.payout.findUnique({
+        where: { id: payoutId }
+      });
+
+      if (!payout) {
+        return {
+          success: false,
+          error: {
+            code: 'PAYOUT_NOT_FOUND',
+            message: 'Payout not found',
+            statusCode: 404
+          }
+        };
+      }
+
+      if (payout.status !== PayoutStatus.PENDING) {
+        return {
+          success: false,
+          error: {
+            code: 'INVALID_PAYOUT_STATUS',
+            message: 'Payout must be in pending status to reject',
+            statusCode: 400
+          }
+        };
+      }
+
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        // Update payout
+        await tx.payout.update({
+          where: { id: payoutId },
+          data: {
+            status: PayoutStatus.FAILED,
+          }
+        });
+
+        // Update transaction (commented out - model not available)
+        // await tx.transaction.updateMany({
+        //   where: {
+        //     referenceId: payoutId,
+        //     referenceType: 'PAYOUT'
+        //   },
+        //   data: {
+        //     status: 'FAILED',
+          }
+        });
+      });
+
+      // Clear cache
+      await this.redis.del(`payout_summary:${payout.sellerId}`);
+
+      logger.info({
+        payoutId,
+        rejectedBy,
+        reason
+      }, 'Payout rejected');
+
+      return { success: true };
+    } catch (error: any) { 
+      logger.error({ error, payoutId }, 'Failed to reject payout');
+      return {
+        success: false,
+        error: {
+          code: 'REJECT_PAYOUT_ERROR',
+          message: 'Failed to reject payout',
+          statusCode: 500
+        }
+      };
+    }
+  }
+}

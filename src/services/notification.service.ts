@@ -33,13 +33,13 @@ export class NotificationService extends CrudService<
       // Create notification
       const notification = await this.prisma.notification.create({
         data: {
-          type: data.type,
+          type: data.type as any, // Cast to handle enum type
           title: data.title,
           message: data.message,
           userId: data.userId,
           data: data.data || {},
           isRead: false,
-        },
+        } as any,
         include: {
           user: {
             select: {
@@ -60,13 +60,11 @@ export class NotificationService extends CrudService<
       await this.prisma.analyticsEvent.create({
         data: {
           type: 'notification_created',
-          category: 'engagement',
-          action: 'create',
-          label: data.type,
           userId: data.userId,
-          metadata: {
+          data: {
             notificationId: notification.id,
-            type: notification.type,
+            notificationType: notification.type,
+            label: data.type,
           },
         },
       });
@@ -80,7 +78,10 @@ export class NotificationService extends CrudService<
         'Notification created successfully'
       );
 
-      return notification;
+      return {
+        ...notification,
+        priority: 'MEDIUM' // Add required priority field
+      } as any;
     } catch (error) {
       this.logger.error({ error, data }, 'Error creating notification');
       throw new ApiError('Failed to create notification', 500, 'NOTIFICATION_CREATION_FAILED');

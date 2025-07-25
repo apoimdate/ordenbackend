@@ -37,38 +37,39 @@ interface SellerSearchParams {
 
 // Removed unused SellerDashboardData interface
 
-interface SellerStats {
-  totalRevenue: number;
-    totalOrders: number;
-    totalProducts: number;
-    avgOrderValue: number;
-    conversionRate: number;
-    topProducts: Array<{
-      productId: string;
-      name: string;
-      revenue: number;
-      orders: number;
-    }>;
-    recentOrders: Array<{
-      orderId: string;
-      orderNumber: string;
-      customerEmail: string;
-      amount: number;
-      status: string;
-      createdAt: Date;
-    }>;
-    monthlyRevenue: Array<{
-      month: string;
-      revenue: number;
-      orders: number;
-    }>;
-  pendingActions: {
-    pendingOrders: number;
-    lowStockProducts: number;
-    pendingWithdrawals: number;
-    unreadMessages: number;
-  };
-}
+// Unused interface - commented out
+// interface SellerStats {
+//   totalRevenue: number;
+//   totalOrders: number;
+//   totalProducts: number;
+//   avgOrderValue: number;
+//   conversionRate: number;
+//   topProducts: Array<{
+//     productId: string;
+//     name: string;
+//     revenue: number;
+//     orders: number;
+//   }>;
+//   recentOrders: Array<{
+//     orderId: string;
+//     orderNumber: string;
+//     customerEmail: string;
+//     amount: number;
+//     status: string;
+//     createdAt: Date;
+//   }>;
+//   monthlyRevenue: Array<{
+//     month: string;
+//     revenue: number;
+//     orders: number;
+//   }>;
+//   pendingActions: {
+//     pendingOrders: number;
+//     lowStockProducts: number;
+//     pendingWithdrawals: number;
+//     unreadMessages: number;
+//   };
+// }
 
 interface SellerWithDetails extends Seller {
   user: {
@@ -147,8 +148,7 @@ export class SellerService extends CrudService<Seller> {
             orders: 0,
             products: 0,
             views: 0,
-            clicks: 0,
-            conversions: 0
+            conversionRate: 0
           }
         });
 

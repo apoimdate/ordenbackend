@@ -24,13 +24,13 @@ interface ShippingZoneWithDetails extends ShippingZone {
   methods?: any[];
 }
 
-interface ShippingCalculationData {
-  destination: {
-    country: string;
-    state?: string;
-    zipCode?: string;
-  };
-}
+// interface ShippingCalculationData {
+//   destination: {
+//     country: string;
+//     state?: string;
+//     zipCode?: string;
+//   };
+// }
 
 export class ShippingService extends CrudService<ShippingZone, Prisma.ShippingZoneCreateInput, Prisma.ShippingZoneUpdateInput> {
   modelName = 'shippingZone' as const;

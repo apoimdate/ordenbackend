@@ -12,7 +12,7 @@ import { OrderRepository } from '../repositories/order.repository';
 import { UserRepository } from '../repositories/user.repository';
 import { WalletRepository } from '../repositories/wallet.repository';
 // import { WalletTransactionRepository } from '../repositories/wallet-transaction.repository'; // Currently not used
-import { ServiceResult } from '../types';
+import { ServiceResult, PaginatedResult } from '../types';
 import { ApiError } from '../utils/errors';
 
 interface CreatePaymentData {
@@ -470,13 +470,15 @@ export class PaymentService extends CrudService<
       }
 
       const payout = await this.payoutRepo.create({
-        sellerId: data.sellerId,
+        seller: {
+          connect: { id: data.sellerId }
+        },
         amount: data.amount,
         currency: data.currency,
         method: data.method,
-        status: PayoutStatus.PENDING,
-        transactionId: result.payoutId
-      });
+        status: 'PENDING',
+        reference: result.payoutId
+      } as any);
 
       // Emit payout created event
       this.app.events?.emit('payout.created', {
@@ -508,7 +510,7 @@ export class PaymentService extends CrudService<
   async searchPayments(params: PaymentSearchParams): Promise<ServiceResult<PaginatedResult<PaymentWithDetails>>> {
     try {
       const cacheKey = `payments:search:${JSON.stringify(params)}`;
-      const cached = await cache.get<PaginatedResult<PaymentWithDetails>>(cacheKey);
+      const cached = await this.app.redis?.get(cacheKey) as PaginatedResult<PaymentWithDetails> | null;
       if (cached) {
         return { success: true, data: cached };
       }
@@ -601,7 +603,7 @@ export class PaymentService extends CrudService<
       };
 
       // Cache for 5 minutes
-      await cache.set(cacheKey, result, { ttl: 300 });
+      await this.app.redis?.setex(cacheKey, 300, JSON.stringify(result));
 
       return { success: true, data: result };
     } catch (error) {
@@ -679,11 +681,13 @@ export class PaymentService extends CrudService<
           }
         });
 
+        const newBalance = Number(wallet.balance) - Number(payment.amount);
         await tx.walletTransaction.create({
           data: {
             walletId: wallet.id,
-            type: 'PAYMENT',
+            type: 'PURCHASE',
             amount: payment.amount,
+            balance: newBalance,
             description: `Payment for order ${order.orderNumber}`,
             referenceId: payment.id,
             referenceType: 'PAYMENT'
@@ -766,11 +770,13 @@ export class PaymentService extends CrudService<
           }
         });
 
+        const newBalance = Number(wallet.balance) + amount;
         await tx.walletTransaction.create({
           data: {
             walletId: wallet.id,
             type: 'REFUND',
             amount: amount,
+            balance: newBalance,
             description: `Refund for order ${order.orderNumber}`,
             referenceId: payment.id,
             referenceType: 'REFUND'

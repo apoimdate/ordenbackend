@@ -1,5 +1,5 @@
 import { FastifyInstance } from 'fastify';
-import { Prisma, PickupLocation } from '@prisma/client';
+import { Prisma, PickupLocation, Order } from '@prisma/client';
 import { ServiceResult } from '../types';
 import { ApiError } from '../utils/errors';
 

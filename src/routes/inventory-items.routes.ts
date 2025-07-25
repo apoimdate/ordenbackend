@@ -43,7 +43,11 @@ export default async function inventoryItemsRoutes(fastify: FastifyInstance) {
       },
     },
     async (request: CreateInventoryItemRequest, reply) => {
-      const inventoryItem = await inventoryItemService.create(request.body);
+      const inventoryItem = await inventoryItemService.create({
+        product: { connect: { id: request.body.productId } },
+        location: { connect: { id: request.body.stockLocationId } },
+        quantity: request.body.quantity
+      });
       reply.code(201).send(inventoryItem);
     }
   );

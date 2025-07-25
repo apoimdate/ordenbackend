@@ -45,9 +45,12 @@ export default async function inventoryMovementsRoutes(
       },
     },
     async (request: CreateInventoryMovementRequest, reply) => {
-      const inventoryMovement = await inventoryMovementService.create(
-        request.body
-      );
+      const inventoryMovement = await inventoryMovementService.create({
+        product: { connect: { id: request.body.productId } },
+        inventory_item: { connect: { id: request.body.inventoryItemId } },
+        quantity: request.body.quantity,
+        type: request.body.type
+      });
       reply.code(201).send(inventoryMovement);
     }
   );

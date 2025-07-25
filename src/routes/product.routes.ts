@@ -111,7 +111,7 @@ export async function productRoutes(fastify: FastifyInstance) {
     preHandler: [authenticate, authorize(['SELLER', 'ADMIN', 'SUPER_ADMIN'])]
   }, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
-      const product = await productService.update({
+      const product = await productService.updateProduct({
         id: (request.params as any).id,
         ...((request.body as any) as any),
       });

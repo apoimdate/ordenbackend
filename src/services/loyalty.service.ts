@@ -114,8 +114,8 @@ export class LoyaltyService extends CrudService<
       PLATINUM: 50000,
       DIAMOND: Infinity,
     };
-    const nextTier = Object.keys(tiers).find(key => tiers[key] > totalEarned);
-    return nextTier ? tiers[nextTier] : 0;
+    const nextTier = Object.keys(tiers).find(key => tiers[key as keyof typeof tiers] > totalEarned);
+    return nextTier ? tiers[nextTier as keyof typeof tiers] : 0;
   }
 
   calculateLoyaltyTier(totalEarned: number): string {
@@ -133,7 +133,7 @@ export class LoyaltyService extends CrudService<
       PLATINUM: 2500,
       DIAMOND: 5000,
     };
-    return bonuses[tier] || 0;
+    return bonuses[tier as keyof typeof bonuses] || 0;
   }
 
   async sendTierUpgradeNotification(userId: string, newTier: string, bonus: number): Promise<void> {
