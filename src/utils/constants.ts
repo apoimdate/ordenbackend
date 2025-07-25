@@ -1,44 +1,4 @@
-// Currency constants
-export enum Currency {
-  USD = 'USD',
-  EUR = 'EUR',
-  GBP = 'GBP',
-  CAD = 'CAD',
-  AUD = 'AUD',
-  JPY = 'JPY',
-  CNY = 'CNY',
-  BRL = 'BRL',
-  MXN = 'MXN',
-  INR = 'INR',
-  KRW = 'KRW',
-  SGD = 'SGD',
-  HKD = 'HKD',
-  NOK = 'NOK',
-  SEK = 'SEK',
-  DKK = 'DKK',
-  CHF = 'CHF',
-  PLN = 'PLN',
-  CZK = 'CZK',
-  HUF = 'HUF',
-  ILS = 'ILS',
-  NZD = 'NZD',
-  ZAR = 'ZAR',
-  THB = 'THB',
-  MYR = 'MYR',
-  PHP = 'PHP',
-  IDR = 'IDR',
-  VND = 'VND',
-  TRY = 'TRY',
-  RUB = 'RUB',
-  AED = 'AED',
-  SAR = 'SAR',
-  EGP = 'EGP',
-  MAD = 'MAD',
-  NGN = 'NGN',
-  KES = 'KES',
-  GHS = 'GHS',
-  // Note: CUP is intentionally excluded as per requirements
-}
+export { Currency } from '@prisma/client';
 
 // User roles
 export enum UserRole {
@@ -388,7 +348,6 @@ export const WEBHOOK_CONFIG = {
 
 // Export all constants as default
 export default {
-  Currency,
   UserRole,
   OrderStatus,
   PaymentStatus,
@@ -417,7 +376,6 @@ export default {
   SYSTEM_LIMITS,
   FRAUD_THRESHOLDS,
   BLOCKED_CURRENCIES,
-  DEFAULT_CURRENCY,
   SUPPORTED_LOCALES,
   DEFAULT_LOCALE,
   API_VERSION,

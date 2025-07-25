@@ -1,5 +1,5 @@
 import { FastifyInstance } from 'fastify';
-import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaClient, Prisma, Currency } from '@prisma/client';
 import type { Payout, Transaction } from '@prisma/client';
 import { Redis } from 'ioredis';
 import { logger } from '../utils/logger';
@@ -7,7 +7,7 @@ import { ServiceResult } from '../types';
 import { validateBankAccount, validatePayPalAccount, BankDetails } from '../utils/payment.validator';
 import { Queue } from 'bullmq';
 import { config } from '../config/environment';
-import { Currency, PayoutMethod, PayoutStatus, TransactionType } from '../utils/constants';
+import { PayoutMethod, PayoutStatus, TransactionType } from '../utils/constants';
 
 export interface CreatePayoutData {
   sellerId: string;
@@ -279,7 +279,7 @@ export class PayoutService {
           data: {
             sellerId: data.sellerId,
             amount: data.amount,
-            currency: data.currency as Prisma.Currency,
+            currency: data.currency,
             method: data.method,
             status: PayoutStatus.PENDING,
             reference: data.notes,

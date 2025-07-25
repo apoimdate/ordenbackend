@@ -1,4 +1,4 @@
-import { AnalyticsEvent, Prisma } from '@prisma/client';
+import { AnalyticsEvent, Prisma, Currency } from '@prisma/client';
 import { FastifyInstance } from 'fastify';
 import { CrudService } from './crud.service';
 import { 
@@ -10,7 +10,7 @@ import {
 import { ServiceResult } from '../types';
 import { cache } from '../utils/cache';
 import { ApiError } from '../utils/errors';
-import { Currency, OrderStatus } from '../utils/constants';
+import { OrderStatus } from '../utils/constants';
 
 interface CreateAnalyticsEventData {
   type: string;
