@@ -87,3 +87,12 @@ src/generated/
 # Local storage
 localStorage/
 sessionStorage/
+# Large files
+typesense-server.tar.gz
+typesense/typesense-server*
+*.tar.gz
+data/
+dist/
+build/
+*.log
+
