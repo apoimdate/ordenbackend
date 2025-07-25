@@ -1,9 +1,10 @@
 import { FastifyInstance } from 'fastify';
-import { PrismaClient, Payout } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
+import type { Payout, Transaction } from '@prisma/client';
 import { Redis } from 'ioredis';
 import { logger } from '../utils/logger';
 import { ServiceResult } from '../types';
-// import { validateBankAccount, validatePayPalAccount } from '../utils/payment.validator';
+import { validateBankAccount, validatePayPalAccount, BankDetails } from '../utils/payment.validator';
 import { Queue } from 'bullmq';
 import { config } from '../config/environment';
 import { Currency, PayoutMethod, PayoutStatus, TransactionType } from '../utils/constants';
@@ -13,12 +14,7 @@ export interface CreatePayoutData {
   amount: number;
   currency: Currency;
   method: PayoutMethod;
-  bankDetails?: {
-    accountNumber: string;
-    routingNumber: string;
-    accountName: string;
-    bankName: string;
-  };
+  bankDetails?: BankDetails;
   paypalEmail?: string;
   notes?: string;
 }
@@ -77,8 +73,10 @@ export class PayoutService {
       }
 
       // Calculate balances from transactions
-      // Transaction model not available - mock data
-      const transactions: any[] = [];
+      const transactions: Array<Pick<Transaction, 'type' | 'status' | 'amount'>> = await this.prisma.transaction.findMany({
+        where: { sellerId },
+        select: { type: true, status: true, amount: true }
+      });
 
       // Calculate balances
       let availableBalance = 0;
@@ -87,8 +85,8 @@ export class PayoutService {
       let totalEarnings = 0;
       let totalPaidOut = 0;
 
-      transactions.forEach((transaction: any) => {
-        const amount = transaction._sum.amount || 0;
+      transactions.forEach((transaction: Pick<Transaction, 'type' | 'status' | 'amount'>) => {
+        const amount = Number(transaction.amount) || 0;
 
         if (transaction.type === TransactionType.ORDER_PAYMENT) {
           if (transaction.status === 'COMPLETED') {
@@ -204,7 +202,7 @@ export class PayoutService {
       }
 
       // Validate payment method
-      if (data.method === PayoutMethod.BANK && !data.bankDetails) {
+      if (data.method === PayoutMethod.BANK_TRANSFER && !data.bankDetails) {
         return {
           success: false,
           error: {
@@ -227,7 +225,7 @@ export class PayoutService {
       }
 
       // Validate payment details
-      if (data.method === PayoutMethod.BANK && data.bankDetails) {
+      if (data.method === PayoutMethod.BANK_TRANSFER && data.bankDetails) {
         const bankValidation = validateBankAccount(data.bankDetails);
         if (!bankValidation.isValid) {
           return {
@@ -261,7 +259,7 @@ export class PayoutService {
       let fixedFee = 0;
 
       switch (data.method) {
-        case PayoutMethod.BANK:
+        case PayoutMethod.BANK_TRANSFER:
           feePercentage = 0.01; // 1%
           fixedFee = 2.5; // $2.50
           break;
@@ -275,13 +273,13 @@ export class PayoutService {
       const netAmount = data.amount - fee;
 
       // Create payout in transaction
-      const payout = await this.prisma.$transaction(async (tx) => {
+      const payout = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         // Create payout record
         const newPayout = await tx.payout.create({
           data: {
             sellerId: data.sellerId,
             amount: data.amount,
-            currency: data.currency,
+            currency: data.currency as Prisma.Currency,
             method: data.method,
             status: PayoutStatus.PENDING,
             reference: data.notes,
@@ -391,7 +389,7 @@ export class PayoutService {
         this.prisma.payout.count({ where })
       ]);
 
-      const payoutDetails: PayoutDetails[] = payouts.map(payout => ({
+      const payoutDetails: PayoutDetails[] = payouts.map((payout: Payout) => ({
         ...payout,
         netAmount: Number(payout.amount) - (Number(payout.amount) * 0.01 + 2.5),
       }));
@@ -452,7 +450,7 @@ export class PayoutService {
         };
       }
 
-      await this.prisma.$transaction(async (tx) => {
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         // Update payout status
         await tx.payout.update({
           where: { id: payoutId },
@@ -608,22 +606,24 @@ export class PayoutService {
       let totalProcessingTime = 0;
       let processedCount = 0;
 
-      payouts.forEach(payout => {
+      payouts.forEach((payout) => {
         statistics.totalAmount += Number(payout.amount);
 
         // By status
-        if (!statistics.byStatus[payout.status]) {
-          statistics.byStatus[payout.status] = { count: 0, amount: 0 };
+        const statusKey = payout.status as PayoutStatus;
+        if (!statistics.byStatus[statusKey]) {
+          statistics.byStatus[statusKey] = { count: 0, amount: 0 };
         }
-        statistics.byStatus[payout.status].count++;
-        statistics.byStatus[payout.status].amount += Number(payout.amount);
+        statistics.byStatus[statusKey].count++;
+        statistics.byStatus[statusKey].amount += Number(payout.amount);
 
         // By method
-        if (!statistics.byMethod[payout.method]) {
-          statistics.byMethod[payout.method] = { count: 0, amount: 0 };
+        const methodKey = payout.method as PayoutMethod;
+        if (!statistics.byMethod[methodKey]) {
+          statistics.byMethod[methodKey] = { count: 0, amount: 0 };
         }
-        statistics.byMethod[payout.method].count++;
-        statistics.byMethod[payout.method].amount += Number(payout.amount);
+        statistics.byMethod[methodKey].count++;
+        statistics.byMethod[methodKey].amount += Number(payout.amount);
 
         // Processing time
         if (payout.processedAt) {
@@ -794,7 +794,7 @@ export class PayoutService {
         this.prisma.payout.count({ where })
       ]);
 
-      const payoutDetails: PayoutDetails[] = payouts.map(payout => ({
+      const payoutDetails: PayoutDetails[] = payouts.map((payout: Payout) => ({
         ...payout,
         netAmount: Number(payout.amount) - (Number(payout.amount) * 0.01 + 2.5),
       }));
@@ -859,7 +859,7 @@ export class PayoutService {
         };
       }
 
-      await this.prisma.$transaction(async (tx) => {
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         // Update payout
         await tx.payout.update({
           where: { id: payoutId },
@@ -940,7 +940,7 @@ export class PayoutService {
         };
       }
 
-      await this.prisma.$transaction(async (tx) => {
+      await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         // Update payout
         await tx.payout.update({
           where: { id: payoutId },

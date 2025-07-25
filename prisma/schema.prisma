@@ -10,44 +10,44 @@ datasource db {
 }
 
 model User {
-  id                String                 @id @default(cuid())
-  email             String                 @unique
-  passwordHash      String
-  firstName         String
-  lastName          String
-  phoneNumber       String?
-  dateOfBirth       DateTime?
-  role              Role                   @default(USER)
-  emailVerified     Boolean                @default(false)
-  phoneVerified     Boolean                @default(false)
-  twoFactorEnabled  Boolean                @default(false)
-  twoFactorMethod   TwoFactorMethod?
-  twoFactorSecret   String?
-  lastLoginAt       DateTime?
-  createdAt         DateTime               @default(now())
-  updatedAt         DateTime               @updatedAt
-  deletedAt         DateTime?
-  searchVector      String?
-  addresses         Address[]
-  cart              Cart?
-  membership        Membership?
-  receivedMessages  Message[]              @relation("ReceivedMessages")
-  sentMessages      Message[]              @relation("SentMessages")
-  notifications     Notification[]
-  orders            Order[]
-  reviews           Review[]
-  seller            Seller?
-  sessions          Session[]
-  supportTickets    SupportTicket[]
-  consent           UserConsent?
-  searchPreferences UserSearchPreference[]
-  wallet            Wallet?
-  wishlist          Wishlist[]
-  abandonedCheckouts AbandonedCheckout[]
-  affiliate         Affiliate?
+  id                   String                 @id @default(cuid())
+  email                String                 @unique
+  passwordHash         String
+  firstName            String
+  lastName             String
+  phoneNumber          String?
+  dateOfBirth          DateTime?
+  role                 Role                   @default(USER)
+  emailVerified        Boolean                @default(false)
+  phoneVerified        Boolean                @default(false)
+  twoFactorEnabled     Boolean                @default(false)
+  twoFactorMethod      TwoFactorMethod?
+  twoFactorSecret      String?
+  lastLoginAt          DateTime?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  deletedAt            DateTime?
+  searchVector         String?
+  addresses            Address[]
+  cart                 Cart?
+  membership           Membership?
+  receivedMessages     Message[]              @relation("ReceivedMessages")
+  sentMessages         Message[]              @relation("SentMessages")
+  notifications        Notification[]
+  orders               Order[]
+  reviews              Review[]
+  seller               Seller?
+  sessions             Session[]
+  supportTickets       SupportTicket[]
+  consent              UserConsent?
+  searchPreferences    UserSearchPreference[]
+  wallet               Wallet?
+  wishlist             Wishlist[]
+  abandonedCheckouts   AbandonedCheckout[]
+  affiliate            Affiliate?
   customerGroupMembers CustomerGroupMember[]
-  conversations     Conversation[]
-  loyaltyPoints   LoyaltyPoints?
+  conversations        Conversation[]
+  loyaltyPoints        LoyaltyPoints?
 
   @@index([email])
   @@index([role])
@@ -125,6 +125,7 @@ model Seller {
   reviews         SellerReview[]
   user            User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   stock_locations stock_locations[]
+  transactions    Transaction[]
 
   @@index([status])
   @@index([rating])
@@ -954,15 +955,15 @@ model Membership {
 }
 
 model LoyaltyPoints {
-  id           String    @id @default(cuid())
-  userId       String    @unique
+  id           String               @id @default(cuid())
+  userId       String               @unique
   points       Int
-  totalEarned  Int       @default(0)
-  totalSpent   Int       @default(0)
-  tier         String    @default("BRONZE")
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  user         User      @relation(fields: [userId], references: [id])
+  totalEarned  Int                  @default(0)
+  totalSpent   Int                  @default(0)
+  tier         String               @default("BRONZE")
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  user         User                 @relation(fields: [userId], references: [id])
   transactions LoyaltyTransaction[]
 
   @@map("loyalty_points")
@@ -1241,6 +1242,25 @@ model Commission {
   @@index([sellerId])
   @@index([status])
   @@map("commissions")
+  @@schema("public")
+}
+
+model Transaction {
+  id            String   @id @default(cuid())
+  sellerId      String
+  type          String
+  amount        Decimal  @db.Decimal(10, 2)
+  status        String   @default("pending")
+  referenceId   String?
+  referenceType String?
+  description   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  seller        Seller   @relation(fields: [sellerId], references: [id])
+
+  @@index([sellerId])
+  @@index([status])
+  @@map("transactions")
   @@schema("public")
 }
 
@@ -2018,14 +2038,14 @@ model StockTransfer {
 }
 
 model ProductCollection {
-  id          String              @id @default(cuid())
+  id          String                  @id @default(cuid())
   name        String
-  slug        String              @unique
+  slug        String                  @unique
   description String?
   imageUrl    String?
-  isActive    Boolean             @default(true)
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
+  isActive    Boolean                 @default(true)
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
   items       ProductCollectionItem[]
 
   @@index([slug])
@@ -2062,14 +2082,14 @@ model UserSearchPreference {
 }
 
 model Message {
-  id             String   @id @default(cuid())
+  id             String       @id @default(cuid())
   senderId       String
   receiverId     String
   content        String
-  isRead         Boolean  @default(false)
-  createdAt      DateTime @default(now())
-  receiver       User     @relation("ReceivedMessages", fields: [receiverId], references: [id])
-  sender         User     @relation("SentMessages", fields: [senderId], references: [id])
+  isRead         Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+  receiver       User         @relation("ReceivedMessages", fields: [receiverId], references: [id])
+  sender         User         @relation("SentMessages", fields: [senderId], references: [id])
   conversation   Conversation @relation(fields: [conversationId], references: [id])
   conversationId String
   attachments    Json?
@@ -2103,15 +2123,15 @@ model CustomsDeclaration {
 }
 
 model CustomsItem {
-  id             String             @id @default(cuid())
-  declarationId  String
-  productId      String
-  description    String
-  quantity       Int
-  value          Decimal            @db.Decimal(10, 2)
-  originCountry  String
-  declaration    CustomsDeclaration @relation(fields: [declarationId], references: [id])
-  product        Product            @relation(fields: [productId], references: [id])
+  id            String             @id @default(cuid())
+  declarationId String
+  productId     String
+  description   String
+  quantity      Int
+  value         Decimal            @db.Decimal(10, 2)
+  originCountry String
+  declaration   CustomsDeclaration @relation(fields: [declarationId], references: [id])
+  product       Product            @relation(fields: [productId], references: [id])
 
   @@index([declarationId])
   @@map("customs_items")
@@ -2132,14 +2152,14 @@ model Log {
 }
 
 model ApiRequestLog {
-  id         String   @id @default(cuid())
-  apiKey     String?
-  ipAddress  String
-  method     String
-  path       String
-  statusCode Int
+  id           String   @id @default(cuid())
+  apiKey       String?
+  ipAddress    String
+  method       String
+  path         String
+  statusCode   Int
   responseTime Int
-  createdAt  DateTime @default(now())
+  createdAt    DateTime @default(now())
 
   @@index([apiKey])
   @@index([createdAt])
@@ -2162,14 +2182,14 @@ model UserActivityLog {
 }
 
 model AuditLog {
-  id         String   @id @default(cuid())
-  userId     String
-  action     String
-  entity     String
-  entityId   String
-  before     Json?
-  after      Json?
-  createdAt  DateTime @default(now())
+  id        String   @id @default(cuid())
+  userId    String
+  action    String
+  entity    String
+  entityId  String
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now())
 
   @@index([userId])
   @@index([entity, entityId])
@@ -2201,13 +2221,13 @@ model duplicate_groups {
 }
 
 model duplicate_products {
-  id                String           @id @default(cuid())
-  product_id        String           @unique
+  id                 String           @id @default(cuid())
+  product_id         String           @unique
   duplicate_group_id String
-  created_at        DateTime         @default(now())
-  updated_at        DateTime         @updatedAt
-  duplicate_group   duplicate_groups @relation(fields: [duplicate_group_id], references: [id])
-  product           Product          @relation(fields: [product_id], references: [id])
+  created_at         DateTime         @default(now())
+  updated_at         DateTime         @updatedAt
+  duplicate_group    duplicate_groups @relation(fields: [duplicate_group_id], references: [id])
+  product            Product          @relation(fields: [product_id], references: [id])
 
   @@map("duplicate_products")
   @@schema("public")
@@ -2229,15 +2249,15 @@ model inventory_items {
 }
 
 model inventory_movements {
-  id              String          @id @default(cuid())
-  product_id      String
+  id                String          @id @default(cuid())
+  product_id        String
   inventory_item_id String
-  quantity        Int
-  type            String
-  created_at      DateTime        @default(now())
-  updated_at      DateTime        @updatedAt
-  product         Product         @relation(fields: [product_id], references: [id])
-  inventory_item  inventory_items @relation(fields: [inventory_item_id], references: [id])
+  quantity          Int
+  type              String
+  created_at        DateTime        @default(now())
+  updated_at        DateTime        @updatedAt
+  product           Product         @relation(fields: [product_id], references: [id])
+  inventory_item    inventory_items @relation(fields: [inventory_item_id], references: [id])
 
   @@map("inventory_movements")
   @@schema("public")
@@ -2341,11 +2361,11 @@ model AbandonedBrowse {
 }
 
 model AbandonedCheckout {
-  id          String   @id @default(cuid())
-  userId      String
-  cart        Json
-  createdAt   DateTime @default(now())
-  user        User     @relation(fields: [userId], references: [id])
+  id        String   @id @default(cuid())
+  userId    String
+  cart      Json
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
 
   @@index([userId])
   @@map("abandoned_checkouts")
@@ -2398,20 +2418,20 @@ model BannedItem {
 }
 
 model CollectionProduct {
-  id           String   @id @default(cuid())
+  id           String  @id @default(cuid())
   collectionId String
   productId    String
-  product      Product  @relation(fields: [productId], references: [id])
+  product      Product @relation(fields: [productId], references: [id])
 
   @@map("collection_products")
   @@schema("public")
 }
 
 model Conversation {
-  id           String    @id @default(cuid())
+  id           String           @id @default(cuid())
   type         ConversationType
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
   messages     Message[]
   participants User[]
 
@@ -2494,20 +2514,20 @@ model PaymentLog {
 }
 
 model PriceRule {
-  id        String  @id @default(cuid())
-  name      String
-  value     Decimal @db.Decimal(10, 2)
-  isActive  Boolean @default(true)
+  id       String  @id @default(cuid())
+  name     String
+  value    Decimal @db.Decimal(10, 2)
+  isActive Boolean @default(true)
 
   @@map("price_rules")
   @@schema("public")
 }
 
 model ScriptTag {
-  id        String   @id @default(cuid())
-  src       String
+  id           String   @id @default(cuid())
+  src          String
   displayScope String
-  createdAt DateTime @default(now())
+  createdAt    DateTime @default(now())
 
   @@map("script_tags")
   @@schema("public")
@@ -2536,10 +2556,10 @@ model SecurityLog {
 }
 
 model Theme {
-  id        String  @id @default(cuid())
-  name      String
-  settings  Json
-  isActive  Boolean @default(true)
+  id       String  @id @default(cuid())
+  name     String
+  settings Json
+  isActive Boolean @default(true)
 
   @@map("themes")
   @@schema("public")
