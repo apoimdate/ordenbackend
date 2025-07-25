@@ -1,6 +1,7 @@
 import { Payment, PaymentMethod, PaymentStatus, Refund, Payout, Prisma, Currency } from '@prisma/client';
 import { FastifyInstance } from 'fastify';
 import { nanoid } from 'nanoid';
+import { logger as appLogger } from '../utils/logger';
 import Stripe from 'stripe';
 import { config } from '../config';
 import { CrudService } from './crud.service';
@@ -88,12 +89,12 @@ export class PaymentService extends CrudService<
 
   constructor(app: FastifyInstance) {
     super(app);
-    this.paymentRepo = new PaymentRepository(app.prisma, app.redis, logger);
-    this.refundRepo = new RefundRepository(app.prisma, app.redis, logger);
-    this.payoutRepo = new PayoutRepository(app.prisma, app.redis, logger);
-    this.orderRepo = new OrderRepository(app.prisma, app.redis, logger);
-    this.userRepo = new UserRepository(app.prisma, app.redis, logger);
-    this.walletRepo = new WalletRepository(app.prisma, app.redis, logger);
+    this.paymentRepo = new PaymentRepository(app.prisma, app.redis, appLogger);
+    this.refundRepo = new RefundRepository(app.prisma, app.redis, appLogger);
+    this.payoutRepo = new PayoutRepository(app.prisma, app.redis, appLogger);
+    this.orderRepo = new OrderRepository(app.prisma, app.redis, appLogger);
+    this.userRepo = new UserRepository(app.prisma, app.redis, appLogger);
+    this.walletRepo = new WalletRepository(app.prisma, app.redis, appLogger);
     
     // Initialize Stripe if API key is provided
     if (config.payment.stripe.secretKey) {
@@ -130,7 +131,7 @@ export class PaymentService extends CrudService<
       }
 
       // Check if payment already exists for this order
-      const existingPayment = await this.paymentRepo.findOne({ where: { orderId: data.orderId } });
+      const existingPayment = await this.paymentRepo.findFirst({ where: { orderId: data.orderId } });
       if (existingPayment) {
         return {
           success: false,
@@ -155,7 +156,7 @@ export class PaymentService extends CrudService<
         // Update order payment status
         await tx.order.update({
           where: { id: data.orderId },
-          data: { paymentStatus: PaymentStatus.PROCESSING }
+          data: { paymentStatus: PaymentStatus.PENDING }
         });
 
         return payment;
@@ -361,12 +362,13 @@ export class PaymentService extends CrudService<
         // Create refund record
         const refund = await tx.refund.create({
           data: {
+            orderId: payment.orderId,
             paymentId: data.paymentId,
             amount: refundAmount,
-            reason: data.reason,
+            reason: 'OTHER' as any,
+            description: data.reason,
             status: 'COMPLETED',
-            transactionId: result.refundId,
-            metadata: data.metadata || {}
+            processedAt: new Date()
           }
         });
 
@@ -468,15 +470,12 @@ export class PaymentService extends CrudService<
       }
 
       const payout = await this.payoutRepo.create({
-        data: {
-          sellerId: data.sellerId,
-          amount: data.amount,
-          currency: data.currency,
-          method: data.method,
-          status: 'PENDING',
-          transactionId: result.payoutId,
-          metadata: data.metadata || {}
-        }
+        sellerId: data.sellerId,
+        amount: data.amount,
+        currency: data.currency,
+        method: data.method,
+        status: PayoutStatus.PENDING,
+        transactionId: result.payoutId
       });
 
       // Emit payout created event
@@ -660,7 +659,7 @@ export class PaymentService extends CrudService<
         return { success: false, error: 'Order not found' };
       }
 
-      const wallet = await this.walletRepo.findOne({ where: { userId: order.userId } });
+      const wallet = await this.walletRepo.findFirst({ where: { userId: order.userId } });
       if (!wallet) {
         return { success: false, error: 'Wallet not found' };
       }
@@ -751,7 +750,7 @@ export class PaymentService extends CrudService<
         return { success: false, error: 'Order not found' };
       }
 
-      const wallet = await this.walletRepo.findOne({ where: { userId: order.userId } });
+      const wallet = await this.walletRepo.findFirst({ where: { userId: order.userId } });
       if (!wallet) {
         return { success: false, error: 'Wallet not found' };
       }

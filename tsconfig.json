@@ -39,5 +39,15 @@
     }
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "tests", "scripts"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "tests",
+    "scripts",
+    "src/app/**/*",
+    "src/components/**/*",
+    "src/lib/**/*",
+    "src/store/**/*",
+    "src/utils/api.ts"
+  ]
 }

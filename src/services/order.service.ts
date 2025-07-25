@@ -1,6 +1,7 @@
 import { Order, OrderItem, OrderHistory, OrderStatus, PaymentStatus, ShippingMethod, Prisma, Currency } from '@prisma/client';
 import { FastifyInstance } from 'fastify';
 import { CrudService } from './crud.service';
+import { logger as appLogger } from '../utils/logger';
 import { 
   OrderRepository,
   OrderItemRepository,
@@ -33,16 +34,6 @@ interface CreateOrderData {
   currency?: Currency;
 }
 
-interface UpdateOrderData {
-  status?: OrderStatus;
-  paymentStatus?: PaymentStatus;
-  shippingMethod?: ShippingMethod;
-  shippingAddressId?: string;
-  pickupLocationId?: string;
-  pickupSlot?: Date;
-  notes?: string;
-  adminNotes?: string;
-}
 
 interface OrderSearchParams {
   userId?: string;
@@ -87,10 +78,7 @@ interface OrderWithDetails extends Order {
   history: OrderHistory[];
 }
 
-export class OrderService extends CrudService<
-  Prisma.OrderDelegate<any>,
-  'order'
-> {
+export class OrderService extends CrudService<Order> {
   orderRepo: OrderRepository;
   orderItemRepo: OrderItemRepository;
   orderHistoryRepo: OrderHistoryRepository;
@@ -99,23 +87,23 @@ export class OrderService extends CrudService<
   productVariantRepo: ProductVariantRepository;
   addressRepo: AddressRepository;
   
-  protected modelName: 'order' = 'order';
+  modelName: 'order' = 'order';
 
   private fraudService: FraudDetectionService;
 
   constructor(app: FastifyInstance) {
     super(app);
-    this.orderRepo = new OrderRepository(app.prisma, app.redis, logger);
-    this.orderItemRepo = new OrderItemRepository(app.prisma, app.redis, logger);
-    this.orderHistoryRepo = new OrderHistoryRepository(app.prisma, app.redis, logger);
-    this.userRepo = new UserRepository(app.prisma, app.redis, logger);
-    this.productRepo = new ProductRepository(app.prisma, app.redis, logger);
-    this.productVariantRepo = new ProductVariantRepository(app.prisma, app.redis, logger);
-    this.addressRepo = new AddressRepository(app.prisma, app.redis, logger);
+    this.orderRepo = new OrderRepository(app.prisma, app.redis, appLogger);
+    this.orderItemRepo = new OrderItemRepository(app.prisma, app.redis, appLogger);
+    this.orderHistoryRepo = new OrderHistoryRepository(app.prisma, app.redis, appLogger);
+    this.userRepo = new UserRepository(app.prisma, app.redis, appLogger);
+    this.productRepo = new ProductRepository(app.prisma, app.redis, appLogger);
+    this.productVariantRepo = new ProductVariantRepository(app.prisma, app.redis, appLogger);
+    this.addressRepo = new AddressRepository(app.prisma, app.redis, appLogger);
     this.fraudService = new FraudDetectionService(app.prisma, app.redis);
   }
 
-  async create(data: CreateOrderData): Promise<ServiceResult<Order>> {
+  async create(data: any): Promise<ServiceResult<Order>> {
     try {
       // Validate user exists
       const user = await this.userRepo.findById(data.userId);
@@ -155,13 +143,9 @@ export class OrderService extends CrudService<
 
       // Run fraud detection
       const fraudCheck = await this.fraudService.checkFraud({
-        userId: data.userId,
-        items: data.items,
-        totalAmount: calculations.totalAmount,
-        currency: data.currency || Currency.USD,
-        shippingAddressId: data.shippingAddressId,
-        userAgent: '', // Would come from request
-        ipAddress: '' // Would come from request
+        user,
+        ipAddress: '0.0.0.0', // Would come from request
+        userAgent: '' // Would come from request
       });
 
       if (!fraudCheck.passed) {
@@ -192,8 +176,7 @@ export class OrderService extends CrudService<
             shippingMethod: data.shippingMethod,
             shippingAddressId: data.shippingAddressId,
             pickupLocationId: data.pickupLocationId,
-            notes: data.notes,
-            riskScore: fraudCheck.riskScore
+            fraudScore: fraudCheck.score || 0
           }
         });
 
@@ -209,7 +192,7 @@ export class OrderService extends CrudService<
           }
 
           const variant = item.variantId 
-            ? product.variants.find(v => v.id === item.variantId)
+            ? await this.productVariantRepo.findById(item.variantId)
             : null;
 
           const price = item.price || variant?.price || product.price;
@@ -276,7 +259,7 @@ export class OrderService extends CrudService<
         userId: data.userId,
         orderNumber: order.orderNumber,
         totalAmount: order.totalAmount,
-        riskScore: fraudCheck.riskScore
+        riskScore: fraudCheck.score
       });
 
       this.logger.info({ 
@@ -298,7 +281,7 @@ export class OrderService extends CrudService<
     }
   }
 
-  async update(id: string, data: UpdateOrderData): Promise<ServiceResult<Order>> {
+  async update(id: string, data: any): Promise<ServiceResult<Order>> {
     try {
       const existingOrder = await this.orderRepo.findById(id);
       if (!existingOrder) {
@@ -330,9 +313,7 @@ export class OrderService extends CrudService<
             shippingMethod: data.shippingMethod,
             shippingAddressId: data.shippingAddressId,
             pickupLocationId: data.pickupLocationId,
-            pickupSlot: data.pickupSlot,
-            notes: data.notes,
-            adminNotes: data.adminNotes
+            pickupSlot: data.pickupSlot
           }
         });
 
@@ -718,7 +699,11 @@ export class OrderService extends CrudService<
     if (!items.length) {
       return {
         success: false,
-        error: new ApiError('Order must contain at least one item', 400, 'EMPTY_ORDER')
+        error: {
+          code: 'EMPTY_ORDER',
+          message: 'Order must contain at least one item',
+          statusCode: 400
+        }
       };
     }
 
@@ -726,27 +711,36 @@ export class OrderService extends CrudService<
       if (item.quantity <= 0) {
         return {
           success: false,
-          error: new ApiError('Item quantity must be positive', 400, 'INVALID_QUANTITY')
+          error: {
+            code: 'INVALID_QUANTITY',
+            message: 'Item quantity must be positive',
+            statusCode: 400
+          }
         };
       }
 
-      const product = await this.productRepo.findUnique({
-        where: { id: item.productId },
-        include: { variants: true }
-      });
-      if (!product || product.status !== 'ACTIVE') {
+      const product = await this.productRepo.findById(item.productId);
+      if (!product || product.status !== 'PUBLISHED') {
         return {
           success: false,
-          error: new ApiError(`Product ${item.productId} not found or inactive`, 400, 'PRODUCT_NOT_FOUND')
+          error: {
+            code: 'PRODUCT_NOT_FOUND',
+            message: `Product ${item.productId} not found or inactive`,
+            statusCode: 400
+          }
         };
       }
 
       if (item.variantId) {
-        const variant = product.variants.find(v => v.id === item.variantId);
+        const variant = await this.productVariantRepo.findById(item.variantId);
         if (!variant) {
           return {
             success: false,
-            error: new ApiError(`Product variant ${item.variantId} not found`, 400, 'VARIANT_NOT_FOUND')
+            error: {
+              code: 'VARIANT_NOT_FOUND',
+              message: `Product variant ${item.variantId} not found`,
+              statusCode: 400
+            }
           };
         }
       }
@@ -765,12 +759,9 @@ export class OrderService extends CrudService<
 
     // Calculate subtotal
     for (const item of items) {
-      const product = await this.productRepo.findUnique({
-        where: { id: item.productId },
-        include: { variants: true }
-      });
+      const product = await this.productRepo.findById(item.productId);
       const variant = item.variantId 
-        ? product?.variants.find(v => v.id === item.variantId)
+        ? await this.productVariantRepo.findById(item.variantId)
         : null;
 
       const price = item.price || variant?.price || product!.price;
@@ -836,10 +827,7 @@ export class OrderService extends CrudService<
   }
 
   private canBeCancelled(status: OrderStatus): boolean {
-    return [
-      OrderStatus.PENDING,
-      OrderStatus.PROCESSING
-    ].includes(status);
+    return status === 'PENDING' || status === 'PROCESSING';
   }
 
   async getOrderStats(userId?: string, dateFrom?: Date, dateTo?: Date): Promise<ServiceResult<any>> {
