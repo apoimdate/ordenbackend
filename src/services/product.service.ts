@@ -1,4 +1,4 @@
-import { Product, Prisma } from '@prisma/client';
+import { Product, Prisma, Currency } from '@prisma/client';
 import { FastifyInstance } from 'fastify';
 import { CrudService } from './crud.service';
 import { ServiceResult, PaginatedResult } from '../types';
@@ -6,7 +6,6 @@ import { cache } from '../utils/cache';
 import { ApiError } from '../utils/errors';
 import { uploadToS3, deleteFromS3, generateImageVariants } from '../utils/storage';
 import { updateSearchIndex, searchProducts } from '../utils/search';
-import { Currency } from '../utils/constants';
 import { ProductRepository, ProductImageRepository } from '../repositories';
 
 interface CreateProductData {
@@ -144,7 +143,7 @@ export class ProductService extends CrudService<Prisma.ProductDelegate<any>, 'pr
             shortDescription: data.shortDescription,
             price: data.price,
             compareAtPrice: data.compareAtPrice,
-            currency: data.currency || 'USD',
+            currency: data.currency || Currency.USD,
             weight: data.weight,
             length: data.length,
             width: data.width,
