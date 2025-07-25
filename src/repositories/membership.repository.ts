@@ -1,0 +1,36 @@
+import { Membership, Prisma } from '@prisma/client';
+import { FindOptionsWithoutWhere } from './base.repository';
+import { BaseRepository } from './base.repository';
+import { PrismaClient } from '@prisma/client';
+import { Redis } from 'ioredis';
+import { Logger } from 'pino';
+
+export class MembershipRepository extends BaseRepository<
+  Membership,
+  Prisma.MembershipCreateInput,
+  Prisma.MembershipUpdateInput
+> {
+  constructor(prisma: PrismaClient, redis: Redis, logger: Logger) {
+    super(prisma, redis, logger, 'membership', 300);
+  }
+
+  async findByUserId(userId: string, options?: FindOptionsWithoutWhere): Promise<Membership[]> {
+    return this.findMany({
+      ...options,
+      where: {
+        
+        userId
+      }
+    });
+  }
+
+  async findActive(options?: FindOptionsWithoutWhere): Promise<Membership[]> {
+    return this.findMany({
+      ...options,
+      where: {
+        
+        isActive: true
+      }
+    });
+  }
+}

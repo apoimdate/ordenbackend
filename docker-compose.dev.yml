@@ -1,0 +1,27 @@
+version: '3.8'
+
+# Development override configuration
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      # Mount source code for hot reloading
+      - ./src:/app/src:ro
+      - ./prisma:/app/prisma:ro
+      - ./.env:/app/.env:ro
+      # Exclude node_modules
+      - /app/node_modules
+    environment:
+      NODE_ENV: development
+    command: npm run dev
+
+  # Enable optional tools in development
+  pgadmin:
+    profiles: []  # Enable by default in dev
+
+  redis-commander:
+    profiles: []  # Enable by default in dev

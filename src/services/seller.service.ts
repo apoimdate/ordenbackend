@@ -1,116 +1,375 @@
-import { api } from '@/lib/api'
-import {
-  Seller,
-  SellerFilters,
-  PaginatedResponse,
-  SellerApprovalForm,
-} from '@/types'
+import { Seller, SellerDocument, SellerAnalytics, SellerBadge, Prisma, SellerStatus } from '@prisma/client';
+import { FastifyInstance } from 'fastify';
+import { CrudService } from './crud.service';
+import { 
+  SellerRepository,
+  UserRepository
+} from "../repositories";
+import { ServiceResult, PaginatedResult } from '../types';
+import { cache } from '../utils/cache';
+import { ApiError } from '../utils/errors';
+import { updateSearchIndex } from '../utils/search';
 
-export class SellerService {
-  // Get sellers with pagination and filtering
-  static async getSellers(filters?: SellerFilters): Promise<PaginatedResponse<Seller>> {
-    return api.get('/sellers', filters)
-  }
+interface CreateSellerData {
+  userId: string;
+  businessName: string;
+  taxId?: string;
+  contactPhone: string;
+  contactEmail: string;
+  commissionRate?: number;
+}
 
-  // Get seller by ID
-  static async getSellerById(id: string): Promise<Seller> {
-    return api.get(`/sellers/${id}`)
-  }
+// Removed unused interfaces
 
-  // Approve or reject seller
-  static async updateSellerStatus(
-    id: string,
-    data: SellerApprovalForm
-  ): Promise<{ success: boolean; message: string }> {
-    return api.patch(`/sellers/${id}/status`, data)
-  }
+interface SellerSearchParams {
+  query?: string;
+  status?: string[];
+  country?: string;
+  state?: string;
+  minRevenue?: number;
+  maxRevenue?: number;
+  dateJoined?: Date;
+  isVerified?: boolean;
+  page?: number;
+  limit?: number;
+  sortBy?: 'newest' | 'oldest' | 'name_asc' | 'name_desc';
+}
 
-  // Get seller analytics
-  static async getSellerAnalytics(id: string): Promise<{
-    totalSales: number
-    totalOrders: number
-    averageOrderValue: number
-    rating: number
-    salesGrowth: number
+// Removed unused SellerDashboardData interface
+
+interface SellerStats {
+  totalRevenue: number;
+    totalOrders: number;
+    totalProducts: number;
+    avgOrderValue: number;
+    conversionRate: number;
     topProducts: Array<{
-      id: string
-      name: string
-      sales: number
-      revenue: number
-    }>
+      productId: string;
+      name: string;
+      revenue: number;
+      orders: number;
+    }>;
     recentOrders: Array<{
-      id: string
-      orderNumber: string
-      total: number
-      status: string
-      createdAt: string
-    }>
-  }> {
-    return api.get(`/sellers/${id}/analytics`)
+      orderId: string;
+      orderNumber: string;
+      customerEmail: string;
+      amount: number;
+      status: string;
+      createdAt: Date;
+    }>;
+    monthlyRevenue: Array<{
+      month: string;
+      revenue: number;
+      orders: number;
+    }>;
+  pendingActions: {
+    pendingOrders: number;
+    lowStockProducts: number;
+    pendingWithdrawals: number;
+    unreadMessages: number;
+  };
+}
+
+interface SellerWithDetails extends Seller {
+  user: {
+    email: string;
+    firstName?: string;
+    lastName?: string;
+  };
+  documents: SellerDocument[];
+  analytics: SellerAnalytics[];
+  badges: Array<{
+    badge: SellerBadge;
+    earnedAt: Date;
+  }>;
+  _count: {
+    products: number;
+    orders: number;
+  };
+}
+
+export class SellerService extends CrudService<Seller> {
+  modelName = 'seller' as const;
+
+  private sellerRepo: SellerRepository;
+  private userRepo: UserRepository;
+  // Removed unused repositories
+
+  constructor(app: FastifyInstance) {
+    super(app);
+    this.sellerRepo = new SellerRepository(this.prisma, this.app.redis, this.logger);
+    this.userRepo = new UserRepository(this.prisma, this.app.redis, this.logger);
   }
 
-  // Suspend seller account
-  static async suspendSeller(
-    id: string,
-    data: { reason: string; duration?: number }
-  ): Promise<{ success: boolean; message: string }> {
-    return api.post(`/sellers/${id}/suspend`, data)
+  async create(data: CreateSellerData): Promise<ServiceResult<Seller>> {
+    try {
+      const user = await this.userRepo.findById(data.userId);
+      if (!user) {
+        return {
+          success: false,
+          error: new ApiError('User not found', 404, 'USER_NOT_FOUND')
+        };
+      }
+
+      const existingSeller = await this.sellerRepo.findFirst({ where: { userId: data.userId } });
+      if (existingSeller) {
+        return {
+          success: false,
+          error: new ApiError('User is already a seller', 400, 'ALREADY_SELLER')
+        };
+      }
+
+      const seller = await this.prisma.$transaction(async (tx) => {
+        const newSeller = await tx.seller.create({
+          data: {
+            user: { connect: { id: data.userId } },
+            businessName: data.businessName,
+            businessEmail: data.contactEmail,
+            businessPhone: data.contactPhone,
+            taxId: data.taxId,
+            commissionRate: data.commissionRate || 10,
+            status: 'PENDING',
+          }
+        });
+
+        await tx.user.update({
+          where: { id: data.userId },
+          data: { 
+            role: 'SELLER'
+          }
+        });
+
+        await tx.sellerAnalytics.create({
+          data: {
+            sellerId: newSeller.id,
+            date: new Date(),
+            revenue: 0,
+            orders: 0,
+            products: 0,
+            views: 0,
+            clicks: 0,
+            conversions: 0
+          }
+        });
+
+        return newSeller;
+      });
+
+      await updateSearchIndex('sellers', {
+        id: seller.id,
+        userId: seller.userId,
+        businessName: seller.businessName,
+        status: seller.status,
+        createdAt: seller.joinedAt.getTime()
+      });
+
+      this.app.log.info({ 
+        sellerId: seller.id,
+        userId: data.userId,
+        businessName: seller.businessName 
+      }, 'Seller created successfully');
+
+      return {
+        success: true,
+        data: seller
+      };
+    } catch (error: any) {
+      this.app.log.error({ err: error }, 'Failed to create seller');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to create seller', 500, error.code, error.message)
+      };
+    }
   }
 
-  // Reactivate seller account
-  static async reactivateSeller(id: string): Promise<{ success: boolean; message: string }> {
-    return api.post(`/sellers/${id}/reactivate`)
+  async update(sellerId: string, data: Partial<CreateSellerData>): Promise<ServiceResult<Seller>> {
+    try {
+      const existingSeller = await this.sellerRepo.findById(sellerId);
+      if (!existingSeller) {
+        return {
+          success: false,
+          error: new ApiError('Seller not found', 404, 'SELLER_NOT_FOUND')
+        };
+      }
+
+      const seller = await this.sellerRepo.update(sellerId, {
+        businessName: data.businessName,
+        taxId: data.taxId,
+        businessPhone: data.contactPhone,
+        businessEmail: data.contactEmail,
+        commissionRate: data.commissionRate,
+      });
+
+      await updateSearchIndex('sellers', {
+        id: seller.id,
+        businessName: seller.businessName,
+        status: seller.status,
+      });
+
+      await cache.invalidatePattern(`sellers:${seller.id}:*`);
+
+      this.app.log.info({ sellerId: seller.id }, 'Seller updated successfully');
+
+      return {
+        success: true,
+        data: seller
+      };
+    } catch (error: any) {
+      this.app.log.error({ err: error }, 'Failed to update seller');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to update seller', 500, error.code, error.message)
+      };
+    }
   }
 
-  // Get seller verification documents
-  static async getSellerDocuments(id: string): Promise<{
-    businessLicense?: string
-    taxCertificate?: string
-    identityDocument?: string
-    bankStatement?: string
-  }> {
-    return api.get(`/sellers/${id}/documents`)
+  async getById(sellerId: string, includeDetails: boolean = true): Promise<ServiceResult<SellerWithDetails | Seller>> {
+    try {
+      const cacheKey = `sellers:${sellerId}:${includeDetails ? 'detailed' : 'basic'}`;
+      const cached = await cache.get<SellerWithDetails | Seller>(cacheKey);
+      if (cached) {
+        return { success: true, data: cached };
+      }
+
+      let seller;
+      if (includeDetails) {
+        seller = await this.sellerRepo.findById(sellerId, {
+          include: {
+            user: {
+              select: {
+                email: true,
+                firstName: true,
+                lastName: true
+              }
+            },
+            documents: true,
+            analytics: true,
+            badges: {
+              include: {
+                badge: true
+              }
+            },
+            _count: {
+              select: {
+                products: true,
+                orders: true
+              }
+            }
+          }
+        });
+      } else {
+        seller = await this.sellerRepo.findById(sellerId);
+      }
+
+      if (!seller) {
+        return {
+          success: false,
+          error: new ApiError('Seller not found', 404, 'SELLER_NOT_FOUND')
+        };
+      }
+
+      await cache.set(cacheKey, JSON.stringify(seller), { ttl: 600 });
+
+      return {
+        success: true,
+        data: seller
+      };
+    } catch (error: any) {
+      this.app.log.error({ err: error }, 'Failed to get seller');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to get seller', 500, error.code, error.message)
+      };
+    }
   }
 
-  // Update seller commission
-  static async updateSellerCommission(
-    id: string,
-    data: { commission: number; reason: string }
-  ): Promise<{ success: boolean; message: string }> {
-    return api.patch(`/sellers/${id}/commission`, data)
-  }
+  async search(params: SellerSearchParams): Promise<ServiceResult<PaginatedResult<SellerWithDetails>>> {
+    try {
+      const cacheKey = `sellers:search:${JSON.stringify(params)}`;
+      const cached = await cache.get<PaginatedResult<SellerWithDetails>>(cacheKey);
+      if (cached) {
+        return { success: true, data: cached };
+      }
 
-  // Get seller activity log
-  static async getSellerActivity(
-    id: string,
-    params?: { page?: number; limit?: number }
-  ): Promise<PaginatedResponse<{
-    id: string
-    action: string
-    description: string
-    timestamp: string
-    metadata?: Record<string, any>
-  }>> {
-    return api.get(`/sellers/${id}/activity`, params)
-  }
+      const where: Prisma.SellerWhereInput = {};
 
-  // Get pending seller approvals count
-  static async getPendingApprovalsCount(): Promise<{ count: number }> {
-    return api.get('/sellers/pending/count')
-  }
+      if (params.query) {
+        where.OR = [
+          { businessName: { contains: params.query, mode: 'insensitive' } },
+        ];
+      }
 
-  // Bulk approve sellers
-  static async bulkApproveSellers(
-    sellerIds: string[]
-  ): Promise<{ success: boolean; approved: number; failed: number }> {
-    return api.post('/sellers/bulk/approve', { sellerIds })
-  }
+      if (params.status?.length) {
+        where.status = { in: params.status as SellerStatus[] };
+      }
 
-  // Export sellers data
-  static async exportSellers(
-    filters?: SellerFilters & { format?: 'csv' | 'excel' }
-  ): Promise<Blob> {
-    const response = await api.get('/sellers/export', filters)
-    return response
+      // isVerified field not available in Seller model
+
+      if (params.dateJoined) {
+        where.joinedAt = { gte: params.dateJoined };
+      }
+
+      let orderBy: Prisma.SellerOrderByWithRelationInput = { joinedAt: 'desc' };
+      switch (params.sortBy) {
+        case 'oldest':
+          orderBy = { joinedAt: 'asc' };
+          break;
+        case 'name_asc':
+          orderBy = { businessName: 'asc' };
+          break;
+        case 'name_desc':
+          orderBy = { businessName: 'desc' };
+          break;
+      }
+
+      const page = params.page || 1;
+      const limit = params.limit || 20;
+      const skip = (page - 1) * limit;
+
+      const [sellers, total] = await Promise.all([
+        this.sellerRepo.findMany({
+          where,
+          include: {
+            user: {
+              select: {
+                email: true,
+                firstName: true,
+                lastName: true
+              }
+            },
+            _count: {
+              select: {
+                products: true,
+                orders: true
+              }
+            }
+          },
+          orderBy,
+          skip,
+          take: limit
+        }),
+        this.sellerRepo.count({ where })
+      ]);
+
+      const result: PaginatedResult<SellerWithDetails> = {
+        data: sellers as unknown as SellerWithDetails[],
+        meta: {
+          total,
+          page,
+          limit,
+          totalPages: Math.ceil(total / limit)
+        }
+      };
+
+      await cache.set(cacheKey, result, { ttl: 300 });
+
+      return { success: true, data: result };
+    } catch (error: any) {
+      this.app.log.error({ err: error }, 'Failed to search sellers');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to search sellers', 500, error.code, error.message)
+      };
+    }
   }
 }
