@@ -1,5 +1,5 @@
 import { FastifyInstance } from 'fastify';
-import { Prisma, Coupon } from '@prisma/client';
+import { Prisma, Coupon, CouponStatus } from '@prisma/client';
 import { ServiceResult, CreateCouponData, UpdateCouponData, CouponWithDetails, ValidateCouponData, ApplyCouponData, CreateFlashSaleData, FlashSaleWithDetails, CouponAnalyticsData } from '../types';
 import { logger } from '../utils/logger';
 import { CrudService } from './crud.service';
@@ -331,7 +331,7 @@ export class CouponService extends CrudService<Coupon> {
       const coupon = couponResult.data!;
 
       // Check if coupon is active
-      if (coupon.status !== 'ACTIVE') {
+      if (coupon.status !== CouponStatus.ACTIVE) {
         throw new ApiError('Coupon is not active', 400);
       }
 

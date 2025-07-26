@@ -699,4 +699,421 @@ export class CategoryService extends CrudService<Category, Prisma.CategoryCreate
 
     return children;
   }
+
+  // PRODUCTION: Enhanced Category Analytics
+
+  async getCategoryAnalytics(categoryId: string): Promise<ServiceResult<{
+    category: Category;
+    productCount: number;
+    directProductCount: number;
+    subcategoryCount: number;
+    totalSubcategoryCount: number;
+    averageProductPrice: number;
+    priceRange: { min: number; max: number };
+    activeProductCount: number;
+    outOfStockCount: number;
+    recentlyAddedProducts: number; // last 30 days
+    topProducts: Array<{
+      id: string;
+      name: string;
+      price: number;
+      viewCount?: number;
+      orderCount?: number;
+    }>;
+    subcategoryBreakdown: Array<{
+      id: string;
+      name: string;
+      productCount: number;
+      activeProductCount: number;
+    }>;
+  }>> {
+    try {
+      const category = await this.categoryRepo.findById(categoryId);
+      if (!category) {
+        return {
+          success: false,
+          error: new ApiError('Category not found', 404, 'CATEGORY_NOT_FOUND')
+        };
+      }
+
+      // Get all descendant category IDs
+      const descendantIds = await this.getAllDescendantIds(categoryId);
+      const allCategoryIds = [categoryId, ...descendantIds];
+
+      // Get product statistics
+      const products = await this.productRepo.findMany({
+        where: {
+          categoryId: { in: allCategoryIds }
+        },
+        include: {
+          _count: {
+            select: {
+              orderItems: true,
+              views: true
+            }
+          }
+        }
+      });
+
+      const directProducts = products.filter(p => p.categoryId === categoryId);
+      const activeProducts = products.filter(p => p.status === 'PUBLISHED');
+      const outOfStockProducts = products.filter(p => p.quantity === 0);
+
+      // Price analytics
+      const prices = products.map(p => parseFloat(p.price.toString()));
+      const averagePrice = prices.length > 0 ? prices.reduce((a, b) => a + b, 0) / prices.length : 0;
+      const minPrice = prices.length > 0 ? Math.min(...prices) : 0;
+      const maxPrice = prices.length > 0 ? Math.max(...prices) : 0;
+
+      // Recently added products (last 30 days)
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      const recentProducts = products.filter(p => p.createdAt >= thirtyDaysAgo);
+
+      // Top products by order count
+      const topProducts = products
+        .sort((a, b) => (b as any)._count.orderItems - (a as any)._count.orderItems)
+        .slice(0, 10)
+        .map(p => ({
+          id: p.id,
+          name: p.name,
+          price: parseFloat(p.price.toString()),
+          viewCount: (p as any)._count.views,
+          orderCount: (p as any)._count.orderItems
+        }));
+
+      // Subcategory breakdown
+      const directSubcategories = await this.categoryRepo.findMany({
+        where: { parentId: categoryId },
+        include: {
+          _count: {
+            select: { products: true }
+          }
+        }
+      });
+
+      const subcategoryBreakdown = await Promise.all(
+        directSubcategories.map(async (subcat) => {
+          const subcatDescendants = await this.getAllDescendantIds(subcat.id);
+          const subcatAllIds = [subcat.id, ...subcatDescendants];
+          
+          const subcatProducts = await this.productRepo.findMany({
+            where: { categoryId: { in: subcatAllIds } }
+          });
+
+          return {
+            id: subcat.id,
+            name: subcat.name,
+            productCount: subcatProducts.length,
+            activeProductCount: subcatProducts.filter(p => p.status === 'PUBLISHED').length
+          };
+        })
+      );
+
+      return {
+        success: true,
+        data: {
+          category,
+          productCount: products.length,
+          directProductCount: directProducts.length,
+          subcategoryCount: directSubcategories.length,
+          totalSubcategoryCount: descendantIds.length,
+          averageProductPrice: Math.round(averagePrice * 100) / 100,
+          priceRange: { min: minPrice, max: maxPrice },
+          activeProductCount: activeProducts.length,
+          outOfStockCount: outOfStockProducts.length,
+          recentlyAddedProducts: recentProducts.length,
+          topProducts,
+          subcategoryBreakdown
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error, categoryId }, 'Failed to get category analytics');
+      return {
+        success: false,
+        error: new ApiError('Failed to get category analytics', 500, 'ANALYTICS_ERROR')
+      };
+    }
+  }
+
+  async getCategoriesOverview(): Promise<ServiceResult<{
+    totalCategories: number;
+    activeCategories: number;
+    rootCategories: number;
+    categoriesWithProducts: number;
+    categoriesWithoutProducts: number;
+    averageProductsPerCategory: number;
+    mostPopularCategories: Array<{
+      id: string;
+      name: string;
+      productCount: number;
+      level: number;
+    }>;
+    categoryDepthDistribution: Record<number, number>;
+    recentlyCreatedCategories: Category[];
+  }>> {
+    try {
+      const allCategories = await this.categoryRepo.findMany({
+        include: {
+          _count: {
+            select: { products: true }
+          }
+        }
+      });
+
+      const activeCategories = allCategories.filter(c => c.isActive);
+      const rootCategories = allCategories.filter(c => !c.parentId);
+      const categoriesWithProducts = allCategories.filter(c => (c as any)._count.products > 0);
+      const categoriesWithoutProducts = allCategories.filter(c => (c as any)._count.products === 0);
+
+      const totalProducts = allCategories.reduce((sum, c) => sum + (c as any)._count.products, 0);
+      const averageProductsPerCategory = allCategories.length > 0 ? totalProducts / allCategories.length : 0;
+
+      // Most popular categories by product count
+      const mostPopularCategories = await Promise.all(
+        allCategories
+          .sort((a, b) => (b as any)._count.products - (a as any)._count.products)
+          .slice(0, 10)
+          .map(async (cat) => ({
+            id: cat.id,
+            name: cat.name,
+            productCount: (cat as any)._count.products,
+            level: await this.getCategoryLevel(cat.id)
+          }))
+      );
+
+      // Category depth distribution
+      const depthDistribution: Record<number, number> = {};
+      for (const category of allCategories) {
+        const level = await this.getCategoryLevel(category.id);
+        depthDistribution[level] = (depthDistribution[level] || 0) + 1;
+      }
+
+      // Recently created categories (last 30 days)
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      const recentCategories = allCategories
+        .filter(c => c.createdAt >= thirtyDaysAgo)
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+        .slice(0, 10);
+
+      return {
+        success: true,
+        data: {
+          totalCategories: allCategories.length,
+          activeCategories: activeCategories.length,
+          rootCategories: rootCategories.length,
+          categoriesWithProducts: categoriesWithProducts.length,
+          categoriesWithoutProducts: categoriesWithoutProducts.length,
+          averageProductsPerCategory: Math.round(averageProductsPerCategory * 100) / 100,
+          mostPopularCategories,
+          categoryDepthDistribution: depthDistribution,
+          recentlyCreatedCategories: recentCategories
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error }, 'Failed to get categories overview');
+      return {
+        success: false,
+        error: new ApiError('Failed to get categories overview', 500, 'OVERVIEW_ERROR')
+      };
+    }
+  }
+
+  async getCategoryPerformanceMetrics(categoryId: string, timeframe: 'week' | 'month' | 'quarter' | 'year' = 'month'): Promise<ServiceResult<{
+    period: { start: Date; end: Date };
+    productViews: number;
+    orderCount: number;
+    revenue: number;
+    averageOrderValue: number;
+    conversionRate: number;
+    topSellingProducts: Array<{
+      id: string;
+      name: string;
+      quantity: number;
+      revenue: number;
+    }>;
+    dailyStats: Array<{
+      date: string;
+      views: number;
+      orders: number;
+      revenue: number;
+    }>;
+  }>> {
+    try {
+      const category = await this.categoryRepo.findById(categoryId);
+      if (!category) {
+        return {
+          success: false,
+          error: new ApiError('Category not found', 404, 'CATEGORY_NOT_FOUND')
+        };
+      }
+
+      // Calculate time period
+      const endDate = new Date();
+      const startDate = new Date();
+      
+      switch (timeframe) {
+        case 'week':
+          startDate.setDate(startDate.getDate() - 7);
+          break;
+        case 'month':
+          startDate.setMonth(startDate.getMonth() - 1);
+          break;
+        case 'quarter':
+          startDate.setMonth(startDate.getMonth() - 3);
+          break;
+        case 'year':
+          startDate.setFullYear(startDate.getFullYear() - 1);
+          break;
+      }
+
+      // Get all descendant category IDs
+      const descendantIds = await this.getAllDescendantIds(categoryId);
+      const allCategoryIds = [categoryId, ...descendantIds];
+
+      // Get products in this category tree
+      const products = await this.productRepo.findMany({
+        where: { categoryId: { in: allCategoryIds } }
+      });
+      const productIds = products.map(p => p.id);
+
+      // Get order items for performance metrics
+      const orderItems = await this.prisma.orderItem.findMany({
+        where: {
+          productId: { in: productIds },
+          order: {
+            createdAt: {
+              gte: startDate,
+              lte: endDate
+            }
+          }
+        },
+        include: {
+          order: true,
+          product: {
+            select: { id: true, name: true }
+          }
+        }
+      });
+
+      // Calculate metrics
+      const orderCount = new Set(orderItems.map(item => item.orderId)).size;
+      const revenue = orderItems.reduce((sum, item) => 
+        sum + (parseFloat(item.price.toString()) * item.quantity), 0
+      );
+      const averageOrderValue = orderCount > 0 ? revenue / orderCount : 0;
+
+      // Get product views (if analytics available)
+      const productViews = await this.prisma.productView.count({
+        where: {
+          productId: { in: productIds },
+          viewedAt: {
+            gte: startDate,
+            lte: endDate
+          }
+        }
+      });
+
+      const conversionRate = productViews > 0 ? (orderCount / productViews) * 100 : 0;
+
+      // Top selling products
+      const productSales: Record<string, { quantity: number; revenue: number; name: string }> = {};
+      orderItems.forEach(item => {
+        if (!productSales[item.productId]) {
+          productSales[item.productId] = {
+            quantity: 0,
+            revenue: 0,
+            name: item.product.name
+          };
+        }
+        productSales[item.productId].quantity += item.quantity;
+        productSales[item.productId].revenue += parseFloat(item.price.toString()) * item.quantity;
+      });
+
+      const topSellingProducts = Object.entries(productSales)
+        .map(([id, data]) => ({ id, ...data }))
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 10);
+
+      // Daily stats
+      const dailyStats: Record<string, { views: number; orders: Set<string>; revenue: number }> = {};
+      
+      // Initialize all days
+      for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
+        const dateKey = d.toISOString().split('T')[0];
+        dailyStats[dateKey] = { views: 0, orders: new Set(), revenue: 0 };
+      }
+
+      // Populate order data
+      orderItems.forEach(item => {
+        const dateKey = item.order.createdAt.toISOString().split('T')[0];
+        if (dailyStats[dateKey]) {
+          dailyStats[dateKey].orders.add(item.orderId);
+          dailyStats[dateKey].revenue += parseFloat(item.price.toString()) * item.quantity;
+        }
+      });
+
+      // Get view data if available
+      const viewData = await this.prisma.productView.findMany({
+        where: {
+          productId: { in: productIds },
+          viewedAt: { gte: startDate, lte: endDate }
+        }
+      });
+
+      viewData.forEach(view => {
+        const dateKey = view.viewedAt.toISOString().split('T')[0];
+        if (dailyStats[dateKey]) {
+          dailyStats[dateKey].views += 1;
+        }
+      });
+
+      const dailyStatsArray = Object.entries(dailyStats).map(([date, data]) => ({
+        date,
+        views: data.views,
+        orders: data.orders.size,
+        revenue: Math.round(data.revenue * 100) / 100
+      })).sort((a, b) => a.date.localeCompare(b.date));
+
+      return {
+        success: true,
+        data: {
+          period: { start: startDate, end: endDate },
+          productViews,
+          orderCount,
+          revenue: Math.round(revenue * 100) / 100,
+          averageOrderValue: Math.round(averageOrderValue * 100) / 100,
+          conversionRate: Math.round(conversionRate * 100) / 100,
+          topSellingProducts,
+          dailyStats: dailyStatsArray
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error, categoryId, timeframe }, 'Failed to get category performance metrics');
+      return {
+        success: false,
+        error: new ApiError('Failed to get performance metrics', 500, 'METRICS_ERROR')
+      };
+    }
+  }
+
+  private async getAllDescendantIds(categoryId: string): Promise<string[]> {
+    const descendants: string[] = [];
+    const queue = [categoryId];
+
+    while (queue.length > 0) {
+      const currentId = queue.shift()!;
+      const children = await this.categoryRepo.findMany({
+        where: { parentId: currentId }
+      });
+
+      for (const child of children) {
+        descendants.push(child.id);
+        queue.push(child.id);
+      }
+    }
+
+    return descendants;
+  }
 }

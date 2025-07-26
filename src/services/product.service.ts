@@ -1,12 +1,12 @@
-import { Product, Prisma, Currency } from '@prisma/client';
+import { Product, Prisma, Currency, ProductStatus } from '@prisma/client';
 import { FastifyInstance } from 'fastify';
 import { CrudService } from './crud.service';
 import { ServiceResult, PaginatedResult } from '../types';
 import { cache } from '../utils/cache';
 import { ApiError } from '../utils/errors';
 // import { uploadToS3, deleteFromS3, generateImageVariants } from '../utils/storage';
-import { updateSearchIndex } from '../utils/search';
-// import { searchProducts } from '../utils/search';
+import { updateSearchIndex, removeFromSearchIndex } from '../utils/search';
+import { searchProducts } from '../utils/search';
 import { ProductRepository, ProductImageRepository } from '../repositories';
 
 interface CreateProductData {
@@ -117,6 +117,17 @@ export class ProductService extends CrudService<Product, any, any> {
         };
       }
 
+      // Validate seller existence
+      const seller = await this.prisma.seller.findUnique({
+        where: { id: data.sellerId }
+      });
+      if (!seller) {
+        return {
+          success: false,
+          error: new ApiError('Invalid seller ID provided', 400, 'INVALID_SELLER')
+        };
+      }
+
       // Validate category
       if (data.categoryId) {
         const category = await this.prisma.category.findUnique({
@@ -126,6 +137,19 @@ export class ProductService extends CrudService<Product, any, any> {
           return {
             success: false,
             error: new ApiError('Invalid category ID provided', 400, 'INVALID_CATEGORY')
+          };
+        }
+      }
+
+      // Validate brand
+      if (data.brandId) {
+        const brand = await this.prisma.brand.findUnique({
+          where: { id: data.brandId }
+        });
+        if (!brand) {
+          return {
+            success: false,
+            error: new ApiError('Invalid brand ID provided', 400, 'INVALID_BRAND')
           };
         }
       }
@@ -149,7 +173,7 @@ export class ProductService extends CrudService<Product, any, any> {
             length: data.length,
             width: data.width,
             height: data.height,
-            status: (data.status ?? 'PUBLISHED') as any,
+            status: data.status ?? ProductStatus.PUBLISHED,
             requiresShipping: data.requiresShipping ?? true,
             trackInventory: data.trackInventory ?? true,
             ...(data.categoryId && { categoryId: data.categoryId }),
@@ -187,8 +211,15 @@ export class ProductService extends CrudService<Product, any, any> {
         return product;
       });
 
-      // Update search index (simplified for now)
-      // TODO: Fix search index implementation
+      // Update search index
+      try {
+        await updateSearchIndex('products', product);
+      } catch (searchError) {
+        this.logger.warn({ 
+          err: searchError, 
+          productId: product.id 
+        }, 'Failed to update search index, product still created successfully');
+      }
 
       // Clear cache
       await cache.invalidatePattern('products:*');
@@ -281,6 +312,16 @@ export class ProductService extends CrudService<Product, any, any> {
         return product;
       });
 
+      // Update search index
+      try {
+        await updateSearchIndex('products', product);
+      } catch (searchError) {
+        this.logger.warn({ 
+          err: searchError, 
+          productId: product.id 
+        }, 'Failed to update search index, product still updated successfully');
+      }
+
       // Clear cache
       await cache.invalidatePattern(`products:${product.id}:*`);
       await cache.invalidatePattern('products:list:*');
@@ -340,7 +381,14 @@ export class ProductService extends CrudService<Product, any, any> {
       });
 
       // Remove from search index
-      await updateSearchIndex('products', { id: productId });
+      try {
+        await removeFromSearchIndex('products', productId);
+      } catch (searchError) {
+        this.logger.warn({ 
+          err: searchError, 
+          productId 
+        }, 'Failed to remove from search index, product still deleted successfully');
+      }
 
       // Clear cache
       await cache.invalidatePattern(`products:${productId}:*`);
@@ -366,48 +414,134 @@ export class ProductService extends CrudService<Product, any, any> {
         return { success: true, data: cached };
       }
 
-      // Use database search since Typesense is not configured
-      
-      // Fallback to database search since Typesense is not configured
-      const where: Prisma.ProductWhereInput = {};
-      
-      if (params.query) {
-        where.OR = [
-          { name: { contains: params.query, mode: 'insensitive' } },
-          { description: { contains: params.query, mode: 'insensitive' } }
-        ];
-      }
-      
-      if (params.categoryIds?.length) {
-        where.categoryId = { in: params.categoryIds };
-      }
-      
-      if (params.minPrice || params.maxPrice) {
-        where.price = {};
-        if (params.minPrice) where.price.gte = params.minPrice;
-        if (params.maxPrice) where.price.lte = params.maxPrice;
-      }
-      
-      const products = await this.productRepo.findMany({
-        where,
-        take: params.limit || 20,
-        skip: ((params.page || 1) - 1) * (params.limit || 20)
-      });
-      
-      const total = await this.productRepo.count({ where });
+      let result: PaginatedResult<Product>;
 
-      // Use database results directly
-      const orderedProducts = products;
+      try {
+        // Try Typesense search first
+        const searchFilters = {
+          categories: params.categoryIds,
+          priceMin: params.minPrice,
+          priceMax: params.maxPrice,
+          tags: params.tags,
+          inStock: params.inStock
+        };
 
-      const result: PaginatedResult<Product> = {
-        data: orderedProducts,
-        meta: {
-          total: total,
-          page: params.page || 1,
-          limit: params.limit || 20,
-          totalPages: Math.ceil(total / (params.limit || 20))
+        // Map sortBy parameter to Typesense format
+        let sortBy = '_text_match:desc';
+        if (params.sortBy) {
+          switch (params.sortBy) {
+            case 'price_asc':
+              sortBy = 'price:asc';
+              break;
+            case 'price_desc':
+              sortBy = 'price:desc';
+              break;
+            case 'newest':
+              sortBy = 'created_at:desc';
+              break;
+            case 'popular':
+              sortBy = 'total_reviews:desc,average_rating:desc';
+              break;
+            default:
+              sortBy = '_text_match:desc';
+          }
         }
-      };
+
+        const searchResult = await searchProducts(
+          params.query || '*',
+          searchFilters,
+          params.page || 1,
+          params.limit || 20,
+          sortBy
+        );
+
+        // Extract products from search hits
+        const products = searchResult.hits.map(hit => hit.document) as Product[];
+
+        result = {
+          data: products,
+          meta: {
+            total: searchResult.found,
+            page: params.page || 1,
+            limit: params.limit || 20,
+            totalPages: Math.ceil(searchResult.found / (params.limit || 20))
+          }
+        };
+
+        this.logger.debug({ 
+          query: params.query, 
+          found: searchResult.found,
+          searchTime: searchResult.search_time_ms 
+        }, 'Typesense search completed');
+
+      } catch (searchError) {
+        // Fallback to database search if Typesense fails
+        this.logger.warn({ 
+          error: searchError,
+          query: params.query 
+        }, 'Typesense search failed, falling back to database search');
+
+        const where: Prisma.ProductWhereInput = {};
+        
+        if (params.query) {
+          where.OR = [
+            { name: { contains: params.query, mode: 'insensitive' } },
+            { description: { contains: params.query, mode: 'insensitive' } }
+          ];
+        }
+        
+        if (params.categoryIds?.length) {
+          where.categoryId = { in: params.categoryIds };
+        }
+        
+        if (params.minPrice || params.maxPrice) {
+          where.price = {};
+          if (params.minPrice) where.price.gte = params.minPrice;
+          if (params.maxPrice) where.price.lte = params.maxPrice;
+        }
+
+        if (params.isActive !== undefined) {
+          where.status = params.isActive ? ProductStatus.PUBLISHED : { not: ProductStatus.PUBLISHED };
+        }
+        
+        // Apply sorting for database search
+        let orderBy: Prisma.ProductOrderByWithRelationInput = { createdAt: 'desc' };
+        if (params.sortBy) {
+          switch (params.sortBy) {
+            case 'price_asc':
+              orderBy = { price: 'asc' };
+              break;
+            case 'price_desc':
+              orderBy = { price: 'desc' };
+              break;
+            case 'newest':
+              orderBy = { createdAt: 'desc' };
+              break;
+            case 'popular':
+              orderBy = { name: 'asc' }; // Fallback since we don't have review counts in database
+              break;
+          }
+        }
+        
+        const products = await this.productRepo.findMany({
+          where,
+          orderBy,
+          take: params.limit || 20,
+          skip: ((params.page || 1) - 1) * (params.limit || 20)
+        });
+        
+        const total = await this.productRepo.count({ where });
+
+        result = {
+          data: products,
+          meta: {
+            total: total,
+            page: params.page || 1,
+            limit: params.limit || 20,
+            totalPages: Math.ceil(total / (params.limit || 20))
+          }
+        };
+      }
 
       // Cache for 5 minutes
       await cache.set(cacheKey, result, { ttl: 300 });

@@ -1,94 +1,78 @@
-export { Currency } from '@prisma/client';
+// PRISMA ENUM RE-EXPORTS - Using single source of truth from schema
+import { 
+  Role as PrismaRole,
+  OrderStatus as PrismaOrderStatus,
+  PaymentStatus as PrismaPaymentStatus,
+  PaymentMethod as PrismaPaymentMethod,
+  ProductStatus as PrismaProductStatus,
+  ProductType as PrismaProductType,
+  SellerStatus as PrismaSellerStatus,
+  ReviewStatus as PrismaReviewStatus,
+  ShippingMethod as PrismaShippingMethod,
+  Currency as PrismaCurrency,
+  WalletTransactionType as PrismaWalletTransactionType,
+  GiftCardStatus as PrismaGiftCardStatus,
+  CouponStatus as PrismaCouponStatus,
+  PromotionType as PrismaPromotionType,
+  TaxType as PrismaTaxType,
+  RefundReason as PrismaRefundReason,
+  CustomsStatus as PrismaCustomsStatus,
+  NotificationType as PrismaNotificationType,
+  TicketStatus as PrismaTicketStatus,
+  TicketPriority as PrismaTicketPriority,
+  ConversationType as PrismaConversationType,
+  CategoryType as PrismaCategoryType,
+  ContentType as PrismaContentType,
+  MembershipTier as PrismaMembershipTier,
+  FraudCheckResult as PrismaFraudCheckResult,
+  TwoFactorMethod as PrismaTwoFactorMethod
+} from '@prisma/client';
 
-// User roles
+// Re-export with original names
+export const Role = PrismaRole;
+export const OrderStatus = PrismaOrderStatus;
+export const PaymentStatus = PrismaPaymentStatus;
+export const PaymentMethod = PrismaPaymentMethod;
+export const ProductStatus = PrismaProductStatus;
+export const ProductType = PrismaProductType;
+export const SellerStatus = PrismaSellerStatus;
+export const ReviewStatus = PrismaReviewStatus;
+export const ShippingMethod = PrismaShippingMethod;
+export const Currency = PrismaCurrency;
+export const WalletTransactionType = PrismaWalletTransactionType;
+export const GiftCardStatus = PrismaGiftCardStatus;
+export const CouponStatus = PrismaCouponStatus;
+export const PromotionType = PrismaPromotionType;
+export const TaxType = PrismaTaxType;
+export const RefundReason = PrismaRefundReason;
+export const CustomsStatus = PrismaCustomsStatus;
+export const NotificationType = PrismaNotificationType;
+export const TicketStatus = PrismaTicketStatus;
+export const TicketPriority = PrismaTicketPriority;
+export const ConversationType = PrismaConversationType;
+export const CategoryType = PrismaCategoryType;
+export const ContentType = PrismaContentType;
+export const MembershipTier = PrismaMembershipTier;
+export const FraudCheckResult = PrismaFraudCheckResult;
+export const TwoFactorMethod = PrismaTwoFactorMethod;
+
+// APPLICATION-SPECIFIC ENUMS (not in Prisma schema)
+// These are application logic enums that don't map to database fields
+
+// User interface roles (extends Prisma Role enum)
 export enum UserRole {
   SUPER_ADMIN = 'SUPER_ADMIN',
-  ADMIN = 'ADMIN',
+  ADMIN = 'ADMIN', 
   STAFF = 'STAFF',
   SELLER = 'SELLER',
   CUSTOMER = 'CUSTOMER',
   GUEST = 'GUEST'
 }
 
-// Order status
-export enum OrderStatus {
-  PENDING = 'PENDING',
-  CONFIRMED = 'CONFIRMED',
-  PROCESSING = 'PROCESSING',
-  SHIPPED = 'SHIPPED',
-  DELIVERED = 'DELIVERED',
-  CANCELLED = 'CANCELLED',
-  REFUNDED = 'REFUNDED',
-  RETURNED = 'RETURNED'
-}
-
-// Payment status
-export enum PaymentStatus {
-  PENDING = 'PENDING',
-  PROCESSING = 'PROCESSING',
-  COMPLETED = 'COMPLETED',
-  FAILED = 'FAILED',
-  CANCELLED = 'CANCELLED',
-  REFUNDED = 'REFUNDED',
-  PARTIALLY_REFUNDED = 'PARTIALLY_REFUNDED'
-}
-
-// Product status
-export enum ProductStatus {
-  DRAFT = 'DRAFT',
-  ACTIVE = 'ACTIVE',
-  INACTIVE = 'INACTIVE',
-  ARCHIVED = 'ARCHIVED',
-  OUT_OF_STOCK = 'OUT_OF_STOCK'
-}
-
-// Seller status
-export enum SellerStatus {
-  PENDING = 'PENDING',
-  UNDER_REVIEW = 'UNDER_REVIEW',
-  APPROVED = 'APPROVED',
-  REJECTED = 'REJECTED',
-  SUSPENDED = 'SUSPENDED',
-  BANNED = 'BANNED'
-}
-
-// Coupon discount types
-export enum DiscountType {
-  PERCENTAGE = 'PERCENTAGE',
-  FIXED_AMOUNT = 'FIXED_AMOUNT',
-  FREE_SHIPPING = 'FREE_SHIPPING',
-  BUY_X_GET_Y = 'BUY_X_GET_Y'
-}
-
-// Review status
-export enum ReviewStatus {
-  PENDING = 'PENDING',
-  APPROVED = 'APPROVED',
-  REJECTED = 'REJECTED',
-  FLAGGED = 'FLAGGED'
-}
-
-// Notification types
-export enum NotificationType {
-  ORDER_CONFIRMATION = 'ORDER_CONFIRMATION',
-  ORDER_SHIPPED = 'ORDER_SHIPPED',
-  ORDER_DELIVERED = 'ORDER_DELIVERED',
-  ORDER_CANCELLED = 'ORDER_CANCELLED',
-  PAYMENT_RECEIVED = 'PAYMENT_RECEIVED',
-  PAYMENT_FAILED = 'PAYMENT_FAILED',
-  PRODUCT_BACK_IN_STOCK = 'PRODUCT_BACK_IN_STOCK',
-  PRICE_DROP = 'PRICE_DROP',
-  REVIEW_REQUEST = 'REVIEW_REQUEST',
-  SELLER_APPLICATION = 'SELLER_APPLICATION',
-  COUPON_EXPIRING = 'COUPON_EXPIRING',
-  FLASH_SALE_STARTING = 'FLASH_SALE_STARTING',
-  SYSTEM_MAINTENANCE = 'SYSTEM_MAINTENANCE'
-}
-
-// Shipping status
+// Shipping status for tracking (not in schema)
 export enum ShippingStatus {
   PENDING = 'PENDING',
-  PROCESSING = 'PROCESSING',
+  PROCESSING = 'PROCESSING', 
   SHIPPED = 'SHIPPED',
   IN_TRANSIT = 'IN_TRANSIT',
   DELIVERED = 'DELIVERED',
@@ -96,25 +80,7 @@ export enum ShippingStatus {
   RETURNED = 'RETURNED'
 }
 
-// Support ticket status
-export enum TicketStatus {
-  OPEN = 'OPEN',
-  IN_PROGRESS = 'IN_PROGRESS',
-  PENDING_CUSTOMER = 'PENDING_CUSTOMER',
-  RESOLVED = 'RESOLVED',
-  CLOSED = 'CLOSED'
-}
-
-// Support ticket priority
-export enum TicketPriority {
-  LOW = 'LOW',
-  MEDIUM = 'MEDIUM',
-  HIGH = 'HIGH',
-  URGENT = 'URGENT',
-  CRITICAL = 'CRITICAL'
-}
-
-// Return request status
+// Return request status (not in schema)
 export enum ReturnStatus {
   PENDING = 'PENDING',
   APPROVED = 'APPROVED',
@@ -124,14 +90,14 @@ export enum ReturnStatus {
   CANCELLED = 'CANCELLED'
 }
 
-// Return request type
+// Return request type (not in schema)
 export enum ReturnType {
   RETURN = 'RETURN',
   EXCHANGE = 'EXCHANGE',
   REFUND = 'REFUND'
 }
 
-// Refund status
+// Refund status (not in schema)
 export enum RefundStatus {
   PENDING = 'PENDING',
   PROCESSING = 'PROCESSING',
@@ -140,7 +106,7 @@ export enum RefundStatus {
   CANCELLED = 'CANCELLED'
 }
 
-// Payout status
+// Payout status (not in schema)
 export enum PayoutStatus {
   PENDING = 'PENDING',
   PROCESSING = 'PROCESSING',
@@ -149,14 +115,14 @@ export enum PayoutStatus {
   CANCELLED = 'CANCELLED'
 }
 
-// Payout method
+// Payout method (not in schema)
 export enum PayoutMethod {
   STRIPE = 'STRIPE',
   PAYPAL = 'PAYPAL',
   BANK_TRANSFER = 'BANK_TRANSFER'
 }
 
-// Transaction type
+// Transaction type (not in schema)
 export enum TransactionType {
   ORDER_PAYMENT = 'ORDER_PAYMENT',
   PAYOUT = 'PAYOUT',
@@ -348,17 +314,37 @@ export const WEBHOOK_CONFIG = {
 
 // Export all constants as default
 export default {
-  UserRole,
+  // Prisma enums (imported)
+  Role,
   OrderStatus,
   PaymentStatus,
+  PaymentMethod,
   ProductStatus,
+  ProductType,
   SellerStatus,
-  DiscountType,
   ReviewStatus,
+  ShippingMethod,
+  Currency,
+  WalletTransactionType,
+  GiftCardStatus,
+  CouponStatus,
+  PromotionType,
+  TaxType,
+  RefundReason,
+  CustomsStatus,
   NotificationType,
-  ShippingStatus,
   TicketStatus,
   TicketPriority,
+  ConversationType,
+  CategoryType,
+  ContentType,
+  MembershipTier,
+  FraudCheckResult,
+  TwoFactorMethod,
+  
+  // Application-specific enums
+  UserRole,
+  ShippingStatus,
   ReturnStatus,
   ReturnType,
   RefundStatus,
@@ -367,6 +353,8 @@ export default {
   TransactionType,
   AnalyticsEventType,
   FileUploadType,
+  
+  // Constants
   RATE_LIMITS,
   PAGINATION,
   SEARCH,

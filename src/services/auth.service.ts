@@ -10,6 +10,7 @@ import { config } from '../config/environment';
 import { UserRepository } from '../repositories/user.repository';
 import { SessionRepository } from '../repositories/session.repository';
 import { UserActivityLogRepository } from '../repositories/user-activity-log.repository';
+import { emailService } from '../utils/email';
 
 export interface RegisterData {
   email: string;
@@ -106,7 +107,12 @@ export class AuthService {
       user.id
     );
 
-    // TODO: Send verification email
+    // Send verification email
+    await emailService.sendVerificationEmail(
+      user.email,
+      user.firstName,
+      verificationToken
+    );
 
     // Create session and generate tokens
     const tokens = await this.createSession(user);
@@ -387,7 +393,12 @@ export class AuthService {
       hashedToken
     );
 
-    // TODO: Send reset email with token
+    // Send reset email with token
+    await emailService.sendPasswordResetEmail(
+      user.email,
+      user.firstName,
+      resetToken
+    );
 
     // Log password reset request
     await this.logActivity(user.id, 'PASSWORD_RESET_REQUESTED');

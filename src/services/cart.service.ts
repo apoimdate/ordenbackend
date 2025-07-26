@@ -1,4 +1,4 @@
-import { Cart, CartItem, Wishlist, Prisma, Currency } from '@prisma/client';
+import { Cart, CartItem, Wishlist, Prisma, Currency, ProductStatus } from '@prisma/client';
 import { FastifyInstance } from 'fastify';
 import { CrudService } from './crud.service';
 import { ServiceResult } from '../types';
@@ -213,7 +213,7 @@ export class CartService extends CrudService<Cart, Prisma.CartCreateInput, Prism
     try {
       // Validate product and variant
       const product = await this.productRepo.findById(data.productId);
-      if (!product || product.status !== 'PUBLISHED') {
+      if (!product || product.status !== ProductStatus.PUBLISHED) {
         return {
           success: false,
           error: new ApiError('Product not found or inactive', 404, 'PRODUCT_NOT_FOUND')
@@ -795,33 +795,268 @@ export class CartService extends CrudService<Cart, Prisma.CartCreateInput, Prism
   }
 
   // Wishlist Management
-  // TODO: Fix wishlist implementation to match Prisma schema - current implementation expects WishlistItem model that doesn't exist
-  async addToWishlist(_userId: string, _data: AddToWishlistData): Promise<ServiceResult<WishlistWithDetails>> {
-    return {
-      success: false,
-      error: new ApiError('Wishlist feature temporarily disabled - schema mismatch', 501)
-    };
+  async addToWishlist(userId: string, data: AddToWishlistData): Promise<ServiceResult<WishlistWithDetails>> {
+    try {
+      // Check if product exists
+      const product = await this.productRepo.findById(data.productId);
+      if (!product) {
+        return {
+          success: false,
+          error: new ApiError('Product not found', 404, 'PRODUCT_NOT_FOUND')
+        };
+      }
+
+      // Check if already in wishlist
+      const existing = await this.prisma.wishlist.findUnique({
+        where: {
+          userId_productId: {
+            userId,
+            productId: data.productId
+          }
+        }
+      });
+
+      if (existing) {
+        return {
+          success: false,
+          error: new ApiError('Product already in wishlist', 409, 'PRODUCT_ALREADY_IN_WISHLIST')
+        };
+      }
+
+      // Add to wishlist
+      await this.prisma.wishlist.create({
+        data: {
+          userId,
+          productId: data.productId
+        }
+      });
+
+      // Clear cache
+      await cache.invalidatePattern(`wishlist:${userId}:*`);
+
+      // Return updated wishlist
+      const wishlist = await this.getWishlist(userId);
+      return wishlist;
+    } catch (error: any) {
+      this.logger.error({ err: error, userId, data }, 'Failed to add to wishlist');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to add to wishlist', 500, error.code, error.message)
+      };
+    }
   }
 
-  async removeFromWishlist(_userId: string, _wishlistItemId: string): Promise<ServiceResult<WishlistWithDetails>> {
-    return {
-      success: false,
-      error: new ApiError('Wishlist feature temporarily disabled - schema mismatch', 501)
-    };
+  async removeFromWishlist(userId: string, wishlistItemId: string): Promise<ServiceResult<WishlistWithDetails>> {
+    try {
+      // Find and verify ownership
+      const wishlistItem = await this.prisma.wishlist.findUnique({
+        where: { id: wishlistItemId }
+      });
+
+      if (!wishlistItem) {
+        return {
+          success: false,
+          error: new ApiError('Wishlist item not found', 404, 'WISHLIST_ITEM_NOT_FOUND')
+        };
+      }
+
+      if (wishlistItem.userId !== userId) {
+        return {
+          success: false,
+          error: new ApiError('Access denied', 403, 'ACCESS_DENIED')
+        };
+      }
+
+      // Remove from wishlist
+      await this.prisma.wishlist.delete({
+        where: { id: wishlistItemId }
+      });
+
+      // Clear cache
+      await cache.invalidatePattern(`wishlist:${userId}:*`);
+
+      // Return updated wishlist
+      const wishlist = await this.getWishlist(userId);
+      return wishlist;
+    } catch (error: any) {
+      this.logger.error({ err: error, userId, wishlistItemId }, 'Failed to remove from wishlist');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to remove from wishlist', 500, error.code, error.message)
+      };
+    }
   }
 
-  async getWishlist(_userId: string): Promise<ServiceResult<WishlistWithDetails>> {
-    return {
-      success: false,
-      error: new ApiError('Wishlist feature temporarily disabled - schema mismatch', 501)
-    };
+  async getWishlist(userId: string): Promise<ServiceResult<WishlistWithDetails>> {
+    try {
+      const cacheKey = `wishlist:${userId}:details`;
+      const cached = await cache.get<WishlistWithDetails>(cacheKey);
+      if (cached) {
+        return { success: true, data: cached };
+      }
+
+      // Get wishlist items with product details
+      const wishlistItems = await this.prisma.wishlist.findMany({
+        where: { userId },
+        include: {
+          product: {
+            include: {
+              seller: {
+                select: {
+                  businessName: true,
+                  status: true
+                }
+              },
+              images: {
+                where: { isPrimary: true },
+                take: 1,
+                select: { url: true }
+              }
+            }
+          }
+        },
+        orderBy: { createdAt: 'desc' }
+      });
+
+      // Transform data to match expected interface
+      const items: WishlistItemWithDetails[] = wishlistItems.map(item => {
+        const currentPrice = Number(item.product.price);
+        const originalPrice = item.product.compareAtPrice ? Number(item.product.compareAtPrice) : currentPrice;
+        const isOnSale = item.product.compareAtPrice ? Number(item.product.compareAtPrice) < currentPrice : false;
+        const discountPercentage = isOnSale ? Math.round(((originalPrice - currentPrice) / originalPrice) * 100) : 0;
+        
+        let stockStatus: 'in_stock' | 'low_stock' | 'out_of_stock' | 'discontinued';
+        if (item.product.status !== ProductStatus.PUBLISHED) {
+          stockStatus = 'discontinued';
+        } else if (item.product.quantity === 0) {
+          stockStatus = 'out_of_stock';
+        } else if (item.product.quantity <= item.product.lowStockAlert) {
+          stockStatus = 'low_stock';
+        } else {
+          stockStatus = 'in_stock';
+        }
+
+        return {
+          ...item,
+          product: {
+            id: item.product.id,
+            name: item.product.name,
+            slug: item.product.slug,
+            price: currentPrice,
+            salePrice: item.product.compareAtPrice ? Number(item.product.compareAtPrice) : undefined,
+            imageUrl: item.product.images && item.product.images.length > 0 
+              ? item.product.images[0].url 
+              : undefined,
+            isActive: item.product.status === ProductStatus.PUBLISHED,
+            inStock: item.product.quantity > 0,
+            stockQuantity: item.product.quantity,
+            averageRating: 0, // TODO: Calculate from reviews
+            sellerId: item.product.sellerId,
+            seller: {
+              storeName: item.product.seller.businessName,
+              isVerified: item.product.seller.status === 'APPROVED'
+            }
+          },
+          currentPrice,
+          originalPrice,
+          priceDropped: isOnSale,
+          discountPercentage,
+          isInCart: false, // TODO: Check if product is already in cart
+          stockStatus
+        };
+      });
+
+      const wishlist: WishlistWithDetails = {
+        items,
+        totalItems: items.length
+      };
+
+      await cache.set(cacheKey, wishlist, { ttl: 300 });
+
+      return {
+        success: true,
+        data: wishlist
+      };
+    } catch (error: any) {
+      this.logger.error({ err: error, userId }, 'Failed to get wishlist');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to get wishlist', 500, error.code, error.message)
+      };
+    }
   }
 
-  async moveToCartFromWishlist(_userId: string, _wishlistItemId: string, _quantity: number = 1): Promise<ServiceResult<{ cart: CartWithDetails; wishlist: WishlistWithDetails }>> {
-    return {
-      success: false,
-      error: new ApiError('Wishlist feature temporarily disabled - schema mismatch', 501)
-    };
+  async moveToCartFromWishlist(userId: string, wishlistItemId: string, quantity: number = 1): Promise<ServiceResult<{ cart: CartWithDetails; wishlist: WishlistWithDetails }>> {
+    try {
+      // Find wishlist item
+      const wishlistItem = await this.prisma.wishlist.findUnique({
+        where: { id: wishlistItemId },
+        include: { product: true }
+      });
+
+      if (!wishlistItem) {
+        return {
+          success: false,
+          error: new ApiError('Wishlist item not found', 404, 'WISHLIST_ITEM_NOT_FOUND')
+        };
+      }
+
+      if (wishlistItem.userId !== userId) {
+        return {
+          success: false,
+          error: new ApiError('Access denied', 403, 'ACCESS_DENIED')
+        };
+      }
+
+      // Add to cart
+      const addToCartResult = await this.addToCart(userId, {
+        productId: wishlistItem.productId,
+        quantity,
+        customizations: {}
+      });
+
+      if (!addToCartResult.success) {
+        return {
+          success: false,
+          error: addToCartResult.error!
+        };
+      }
+
+      // Remove from wishlist
+      await this.prisma.wishlist.delete({
+        where: { id: wishlistItemId }
+      });
+
+      // Clear caches
+      await cache.invalidatePattern(`wishlist:${userId}:*`);
+
+      // Get updated data
+      const [cartResult, wishlistResult] = await Promise.all([
+        this.getCartWithDetails(addToCartResult.data!.id),
+        this.getWishlist(userId)
+      ]);
+
+      if (!cartResult || !wishlistResult.success) {
+        return {
+          success: false,
+          error: new ApiError('Failed to retrieve updated data', 500, 'DATA_RETRIEVAL_ERROR')
+        };
+      }
+
+      return {
+        success: true,
+        data: {
+          cart: cartResult,
+          wishlist: wishlistResult.data!
+        }
+      };
+    } catch (error: any) {
+      this.logger.error({ err: error, userId, wishlistItemId, quantity }, 'Failed to move from wishlist to cart');
+      return {
+        success: false,
+        error: error instanceof ApiError ? error : new ApiError('Failed to move from wishlist to cart', 500, error.code, error.message)
+      };
+    }
   }
 
   // Private helper methods
@@ -874,7 +1109,7 @@ export class CartService extends CrudService<Cart, Prisma.CartCreateInput, Prism
       const availableStock = item.variant?.quantity ?? item.product.quantity ?? 0;
       
       let stockStatus: CartItemWithDetails['stockStatus'] = 'in_stock';
-      if (item.product.status !== 'PUBLISHED') {
+      if (item.product.status !== ProductStatus.PUBLISHED) {
         stockStatus = 'discontinued';
       } else if (availableStock === 0) {
         stockStatus = 'out_of_stock';

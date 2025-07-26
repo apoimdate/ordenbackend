@@ -1,4 +1,4 @@
-import { Order, OrderItem, OrderHistory, OrderStatus, PaymentStatus, ShippingMethod, Prisma, Currency } from '@prisma/client';
+import { Order, OrderItem, OrderHistory, OrderStatus, PaymentStatus, ShippingMethod, Prisma, Currency, ProductStatus } from '@prisma/client';
 import { FastifyInstance } from 'fastify';
 import { CrudService } from './crud.service';
 import { logger as appLogger } from '../utils/logger';
@@ -720,7 +720,7 @@ export class OrderService extends CrudService<Order> {
       }
 
       const product = await this.productRepo.findById(item.productId);
-      if (!product || product.status !== 'PUBLISHED') {
+      if (!product || product.status !== ProductStatus.PUBLISHED) {
         return {
           success: false,
           error: {
@@ -739,6 +739,18 @@ export class OrderService extends CrudService<Order> {
             error: {
               code: 'VARIANT_NOT_FOUND',
               message: `Product variant ${item.variantId} not found`,
+              statusCode: 400
+            }
+          };
+        }
+
+        // SECURITY FIX: Validate that variant belongs to the specified product
+        if (variant.productId !== item.productId) {
+          return {
+            success: false,
+            error: {
+              code: 'INVALID_PRODUCT_VARIANT',
+              message: `Product variant ${item.variantId} does not belong to product ${item.productId}`,
               statusCode: 400
             }
           };
@@ -763,6 +775,15 @@ export class OrderService extends CrudService<Order> {
       const variant = item.variantId 
         ? await this.productVariantRepo.findById(item.variantId)
         : null;
+
+      // SECURITY FIX: Validate that variant belongs to the product
+      if (variant && variant.productId !== item.productId) {
+        throw new ApiError(
+          `Product variant ${item.variantId} does not belong to product ${item.productId}`,
+          400,
+          'INVALID_PRODUCT_VARIANT'
+        );
+      }
 
       const price = item.price || variant?.price || product!.price;
       subtotal += Number(price) * item.quantity;
