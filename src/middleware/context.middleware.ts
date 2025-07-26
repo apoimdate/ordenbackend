@@ -4,6 +4,66 @@ import { RequestContext } from '../types';
 
 export { RequestContext };
 
+// API Key validation function
+async function validateApiKey(apiKey: string) {
+  try {
+    // Look up API key in database (this assumes you have an ApiKey model)
+    // Since ApiKey model might not exist, we'll do a simple validation for now
+    
+    // For demo purposes - validate against environment variables or hardcoded keys
+    const validApiKeys = process.env.VALID_API_KEYS?.split(',') || [];
+    const adminApiKey = process.env.ADMIN_API_KEY;
+    
+    if (validApiKeys.includes(apiKey) || apiKey === adminApiKey) {
+      return {
+        id: `api_${Date.now()}`,
+        userId: 'system',
+        userType: 'api',
+        permissions: ['read', 'write'], // Default permissions
+        isActive: true,
+        name: 'API Access'
+      };
+    }
+
+    // If you have an ApiKey model in your schema, use this instead:
+    // const apiKeyRecord = await prisma.apiKey.findUnique({
+    //   where: { 
+    //     key: apiKey,
+    //     isActive: true 
+    //   },
+    //   include: {
+    //     user: {
+    //       select: {
+    //         id: true,
+    //         email: true,
+    //         role: true,
+    //         permissions: true,
+    //         isActive: true
+    //       }
+    //     }
+    //   }
+    // });
+
+    // if (!apiKeyRecord || !apiKeyRecord.user.isActive) {
+    //   return null;
+    // }
+
+    // return {
+    //   id: apiKeyRecord.id,
+    //   userId: apiKeyRecord.user.id,
+    //   userType: apiKeyRecord.user.role,
+    //   permissions: apiKeyRecord.user.permissions,
+    //   isActive: apiKeyRecord.isActive,
+    //   name: apiKeyRecord.name
+    // };
+
+    return null; // Invalid API key
+  } catch (error) {
+    logger.error({ error }, 'Error validating API key');
+    throw new Error('API key validation failed');
+  }
+}
+
 export async function contextMiddleware(fastify: FastifyInstance) {
   fastify.decorateRequest('context', {});
 
@@ -35,8 +95,30 @@ export async function contextMiddleware(fastify: FastifyInstance) {
     // Check for API key authentication
     const apiKey = request.headers['x-api-key'] as string;
     if (apiKey && !context.isAuthenticated) {
-      // TODO: Validate API key and set context
-      context.apiKey = apiKey;
+      try {
+        const validatedApiKey = await validateApiKey(apiKey);
+        if (validatedApiKey) {
+          context.isAuthenticated = true;
+          context.userId = validatedApiKey.userId;
+          context.userType = validatedApiKey.userType || 'api';
+          context.permissions = validatedApiKey.permissions || [];
+          context.apiKey = apiKey;
+          context.apiKeyId = validatedApiKey.id;
+          
+          logger.debug({
+            traceId: context.traceId,
+            apiKeyId: validatedApiKey.id,
+            userId: validatedApiKey.userId,
+            userType: context.userType
+          }, 'API key authenticated');
+        }
+      } catch (error) {
+        logger.warn({
+          traceId: context.traceId,
+          apiKey: `${apiKey.substring(0, 8)  }***`, // Log only first 8 chars for security
+          error: (error as Error).message
+        }, 'API key validation failed');
+      }
     }
 
     // Attach context to request

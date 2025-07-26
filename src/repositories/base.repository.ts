@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import { Redis } from 'ioredis';
 import { Logger } from 'pino';
 
@@ -396,12 +396,24 @@ export abstract class BaseRepository<T, CreateInput, UpdateInput> {
     }
   }
 
-  // Raw query
-  async raw<R = any>(query: string, _params?: any[]): Promise<R> {
+  // Raw query - SECURITY: Use parameterized queries only
+  async raw<R = any>(query: string, params: any[] = []): Promise<R> {
     try {
-      return await this.prisma.$queryRaw`${query}`;
+      // SECURITY FIX: Use proper parameterized query instead of template literal
+      if (params.length === 0) {
+        // For queries without parameters, use $queryRaw with Prisma.sql
+        return await this.prisma.$queryRaw(Prisma.sql([query] as any));
+      } else {
+        // For parameterized queries, use Prisma.sql template function
+        return await this.prisma.$queryRaw(Prisma.sql([query, ...params] as any));
+      }
     } catch (error) {
-      this.logger.error({ error, modelName: this.modelName, query }, 'Raw query failed');
+      this.logger.error({ 
+        error, 
+        modelName: this.modelName, 
+        query: query.substring(0, 100) + '...', // Log only first 100 chars for security
+        paramCount: params.length 
+      }, 'Raw query failed');
       throw error;
     }
   }

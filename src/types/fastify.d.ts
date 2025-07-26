@@ -6,7 +6,6 @@ import { FastifyRequest } from 'fastify';
 import { JWT } from '@fastify/jwt';
 import TypesenseClient from 'typesense';
 import Stripe from 'stripe';
-import { FastifyRedis } from '@fastify/redis';
 
 // JWT Payload Type
 export interface JWTPayload {
@@ -31,6 +30,7 @@ export interface RequestContext {
   startTime?: number;
   isAuthenticated?: boolean;
   apiKey?: string;
+  apiKeyId?: string;
 }
 
 // Request with tracing

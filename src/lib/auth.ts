@@ -2,6 +2,34 @@ import { NextAuthOptions } from 'next-auth'
 import CredentialsProvider from 'next-auth/providers/credentials'
 import { LoginCredentials, LoginResponse } from '@/types'
 
+// Token refresh function
+async function refreshAccessToken(token: any) {
+  try {
+    // In a real implementation, this would call your auth provider's refresh endpoint
+    // For now, we'll implement a basic JWT refresh logic
+    
+    if (!token.refreshToken) {
+      throw new Error('No refresh token available');
+    }
+
+    // For demo purposes - in production you'd validate the refresh token properly
+    // and call your authentication service
+    
+    // Generate new access token (simplified - in production use proper JWT)
+    const newAccessToken = `${token.sub}_${Date.now()}_${Math.random().toString(36).substring(2)}`;
+    
+    return {
+      access_token: newAccessToken,
+      expires_in: 3600, // 1 hour
+      refresh_token: token.refreshToken, // Keep existing refresh token
+      token_type: 'Bearer'
+    };
+  } catch (error) {
+    console.error('Error in refreshAccessToken:', error);
+    throw error;
+  }
+}
+
 export const authOptions: NextAuthOptions = {
   providers: [
     CredentialsProvider({
@@ -74,11 +102,27 @@ export const authOptions: NextAuthOptions = {
         }
       }
 
-      // Check if token needs refresh
-      if (token.accessToken) {
-        // TODO: Implement token refresh logic
-        // const refreshedToken = await refreshAccessToken(token)
-        // if (refreshedToken) return refreshedToken
+      // Check if token needs refresh (if expires within 5 minutes)
+      if (token.accessToken && token.expires) {
+        const shouldRefresh = Date.now() >= (token.expires as number) - 5 * 60 * 1000; // 5 minutes before expiry
+        
+        if (shouldRefresh && token.refreshToken) {
+          try {
+            const refreshedToken = await refreshAccessToken(token);
+            if (refreshedToken) {
+              return {
+                ...token,
+                accessToken: refreshedToken.access_token,
+                expires: Date.now() + refreshedToken.expires_in * 1000,
+                refreshToken: refreshedToken.refresh_token || token.refreshToken
+              };
+            }
+          } catch (error) {
+            console.error('Error refreshing token:', error);
+            // Return token with error flag to trigger re-authentication
+            return { ...token, error: 'RefreshAccessTokenError' };
+          }
+        }
       }
 
       return token
