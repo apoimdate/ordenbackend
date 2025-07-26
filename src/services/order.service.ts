@@ -211,16 +211,74 @@ export class OrderService extends CrudService<Order> {
             }
           });
 
-          // Update inventory if tracking
+          // Handle inventory reservation
           if (product.trackInventory) {
-            // Note: This would typically update an inventory table
-            // Since we don't have one, we'll emit an event instead
-            this.app.events?.emit('inventory.reserved', {
-              productId: item.productId,
-              variantId: item.variantId,
-              quantity: item.quantity,
-              orderId: newOrder.id
-            });
+            // Default to main warehouse if no location specified
+            const defaultLocationId = 'main-warehouse'; // This should come from configuration
+            
+            try {
+              // Find inventory item
+              const inventoryItem = await tx.inventory_items.findFirst({
+                where: {
+                  product_id: item.productId,
+                  location_id: defaultLocationId
+                }
+              });
+
+              if (!inventoryItem) {
+                throw new ApiError(`No inventory found for product ${product.name}`, 400, 'NO_INVENTORY');
+              }
+
+              // Check current reservations for this product
+              const currentReservations = await tx.inventory_reservations.aggregate({
+                where: {
+                  product_id: item.productId
+                },
+                _sum: { quantity: true }
+              });
+
+              const reservedQuantity = currentReservations._sum.quantity || 0;
+              const availableQuantity = inventoryItem.quantity - reservedQuantity;
+
+              if (item.quantity > availableQuantity) {
+                throw new ApiError(
+                  `Insufficient stock for ${product.name}. Available: ${availableQuantity}, Requested: ${item.quantity}`,
+                  400,
+                  'INSUFFICIENT_STOCK'
+                );
+              }
+
+              // Create inventory reservation
+              await tx.inventory_reservations.create({
+                data: {
+                  id: nanoid(),
+                  product_id: item.productId,
+                  order_id: newOrder.id,
+                  quantity: item.quantity
+                }
+              });
+
+              // Create inventory movement record
+              await tx.inventory_movements.create({
+                data: {
+                  id: nanoid(),
+                  product_id: item.productId,
+                  inventory_item_id: inventoryItem.id,
+                  type: 'RESERVED',
+                  quantity: item.quantity
+                }
+              });
+
+            } catch (inventoryError) {
+              this.logger.error({ 
+                error: inventoryError, 
+                productId: item.productId,
+                quantity: item.quantity 
+              }, 'Failed to reserve inventory for order item');
+              
+              // Re-throw inventory errors to cancel the order
+              throw inventoryError;
+            }
           }
         }
 
@@ -903,6 +961,138 @@ export class OrderService extends CrudService<Order> {
       return {
         success: false,
         error: error instanceof ApiError ? error : new ApiError('Failed to get order stats', 500)
+      };
+    }
+  }
+
+  // PRODUCTION: Basic Inventory Management Integration
+
+  async fulfillOrder(orderId: string): Promise<ServiceResult<{
+    orderId: string;
+    fulfilledItems: number;
+  }>> {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // Get order with reservations
+        const reservations = await tx.inventory_reservations.findMany({
+          where: { order_id: orderId }
+        });
+
+        // Remove reservations and reduce inventory
+        for (const reservation of reservations) {
+          // Find inventory item
+          const inventoryItem = await tx.inventory_items.findFirst({
+            where: { product_id: reservation.product_id }
+          });
+
+          if (inventoryItem) {
+            // Reduce actual inventory
+            await tx.inventory_items.update({
+              where: { id: inventoryItem.id },
+              data: {
+                quantity: Math.max(0, inventoryItem.quantity - reservation.quantity)
+              }
+            });
+
+            // Create fulfillment movement
+            await tx.inventory_movements.create({
+              data: {
+                id: nanoid(),
+                product_id: reservation.product_id,
+                inventory_item_id: inventoryItem.id,
+                type: 'FULFILLED',
+                quantity: reservation.quantity
+              }
+            });
+          }
+
+          // Remove reservation
+          await tx.inventory_reservations.delete({
+            where: { id: reservation.id }
+          });
+        }
+
+        // Update order status
+        await tx.order.update({
+          where: { id: orderId },
+          data: { status: OrderStatus.SHIPPED }
+        });
+
+        return {
+          success: true,
+          data: {
+            orderId,
+            fulfilledItems: reservations.length
+          }
+        };
+      });
+    } catch (error) {
+      this.logger.error({ error, orderId }, 'Failed to fulfill order');
+      return {
+        success: false,
+        error: new ApiError('Failed to fulfill order', 500, 'FULFILLMENT_ERROR')
+      };
+    }
+  }
+
+  async cancelOrder(orderId: string, reason: string): Promise<ServiceResult<{
+    orderId: string;
+    releasedReservations: number;
+  }>> {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        // Get and remove reservations
+        const reservations = await tx.inventory_reservations.findMany({
+          where: { order_id: orderId }
+        });
+
+        for (const reservation of reservations) {
+          // Create cancellation movement
+          await tx.inventory_movements.create({
+            data: {
+              id: nanoid(),
+              product_id: reservation.product_id,
+              inventory_item_id: '', // Will be set by repository
+              type: 'CANCELLED',
+              quantity: reservation.quantity
+            }
+          });
+
+          // Remove reservation
+          await tx.inventory_reservations.delete({
+            where: { id: reservation.id }
+          });
+        }
+
+        // Update order status
+        await tx.order.update({
+          where: { id: orderId },
+          data: { status: OrderStatus.CANCELLED }
+        });
+
+        // Add history
+        await tx.orderHistory.create({
+          data: {
+            orderId,
+            status: OrderStatus.CANCELLED,
+            note: `Order cancelled: ${reason}`,
+            createdBy: 'system'
+          }
+        });
+
+        return {
+          success: true,
+          data: {
+            orderId,
+            releasedReservations: reservations.length
+          }
+        };
+      });
+    } catch (error) {
+      this.logger.error({ error, orderId }, 'Failed to cancel order');
+      return {
+        success: false,
+        error: new ApiError('Failed to cancel order', 500, 'CANCELLATION_ERROR')
       };
     }
   }

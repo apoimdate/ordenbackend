@@ -831,13 +831,549 @@ export class PaymentService extends CrudService<
     });
   }
 
-  private async getSellerAvailableBalance(_sellerId: string): Promise<number> {
-    // This would calculate the seller's available balance from commissions, sales, etc.
-    // For now, return a placeholder value
-    return 1000.00;
+  private async getSellerAvailableBalance(sellerId: string): Promise<number> {
+    try {
+      // Calculate available balance from completed sales minus payouts
+      const [totalSales, totalPayouts, pendingPayouts] = await Promise.all([
+        // Total sales from paid orders
+        this.prisma.payment.aggregate({
+          where: {
+            status: PaymentStatus.PAID,
+            order: {
+              items: {
+                some: {
+                  product: {
+                    sellerId
+                  }
+                }
+              }
+            }
+          },
+          _sum: {
+            amount: true
+          }
+        }),
+        // Total payouts completed
+        this.prisma.payout.aggregate({
+          where: {
+            sellerId,
+            status: 'PAID'
+          },
+          _sum: {
+            amount: true
+          }
+        }),
+        // Pending payouts
+        this.prisma.payout.aggregate({
+          where: {
+            sellerId,
+            status: { in: ['PENDING', 'PROCESSING'] }
+          },
+          _sum: {
+            amount: true
+          }
+        })
+      ]);
+
+      const sales = parseFloat(totalSales._sum.amount?.toString() || '0');
+      const payouts = parseFloat(totalPayouts._sum.amount?.toString() || '0');
+      const pending = parseFloat(pendingPayouts._sum.amount?.toString() || '0');
+
+      // Apply platform commission (e.g., 10%)
+      const platformCommission = sales * 0.10;
+      const netSales = sales - platformCommission;
+
+      // Available balance = net sales - completed payouts - pending payouts
+      const availableBalance = netSales - payouts - pending;
+
+      return Math.max(0, availableBalance);
+    } catch (error) {
+      this.logger.error({ error, sellerId }, 'Failed to calculate seller available balance');
+      return 0;
+    }
   }
 
   private generateTransactionId(): string {
     return `TXN-${Date.now()}-${nanoid(8).toUpperCase()}`;
+  }
+
+  // PRODUCTION: Payment Webhook and Status Management
+
+  async handleStripeWebhook(event: Stripe.Event): Promise<ServiceResult<void>> {
+    try {
+      switch (event.type) {
+        case 'payment_intent.succeeded':
+          await this.handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent);
+          break;
+        
+        case 'payment_intent.payment_failed':
+          await this.handlePaymentIntentFailed(event.data.object as Stripe.PaymentIntent);
+          break;
+        
+        case 'charge.refunded':
+          await this.handleChargeRefunded(event.data.object as Stripe.Charge);
+          break;
+        
+        case 'charge.dispute.created':
+          await this.handleDisputeCreated(event.data.object as Stripe.Dispute);
+          break;
+        
+        case 'payout.paid':
+          await this.handlePayoutPaid(event.data.object as Stripe.Payout);
+          break;
+        
+        case 'payout.failed':
+          await this.handlePayoutFailed(event.data.object as Stripe.Payout);
+          break;
+        
+        default:
+          this.logger.info({ eventType: event.type }, 'Unhandled Stripe webhook event');
+      }
+
+      return { success: true, data: undefined };
+    } catch (error) {
+      this.logger.error({ error, eventType: event.type }, 'Failed to handle Stripe webhook');
+      return {
+        success: false,
+        error: new ApiError('Failed to handle webhook', 500, 'WEBHOOK_ERROR')
+      };
+    }
+  }
+
+  private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent): Promise<void> {
+    const paymentId = paymentIntent.metadata.paymentId;
+    if (!paymentId) {
+      this.logger.warn({ paymentIntentId: paymentIntent.id }, 'Payment intent missing paymentId metadata');
+      return;
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      // Update payment status
+      const payment = await tx.payment.update({
+        where: { id: paymentId },
+        data: {
+          status: PaymentStatus.PAID,
+          transactionId: paymentIntent.id,
+          completedAt: new Date(),
+          gatewayResponse: {
+            stripePaymentIntentId: paymentIntent.id,
+            stripeStatus: paymentIntent.status,
+            stripeAmount: paymentIntent.amount,
+            stripeCurrency: paymentIntent.currency,
+            stripeCustomerId: typeof paymentIntent.customer === 'string' ? paymentIntent.customer : paymentIntent.customer?.id || null
+          }
+        }
+      });
+
+      // Update order status
+      await tx.order.update({
+        where: { id: payment.orderId },
+        data: {
+          paymentStatus: PaymentStatus.PAID,
+          status: 'PROCESSING'
+        }
+      });
+
+      // Create order history
+      await tx.orderHistory.create({
+        data: {
+          orderId: payment.orderId,
+          status: 'PROCESSING',
+          note: 'Payment confirmed via Stripe webhook',
+          createdBy: 'system'
+        }
+      });
+
+      // Create seller commission records
+      await this.createSellerCommissions(tx, payment.orderId);
+    });
+
+    this.logger.info({ paymentId, paymentIntentId: paymentIntent.id }, 'Payment intent succeeded webhook processed');
+  }
+
+  private async handlePaymentIntentFailed(paymentIntent: Stripe.PaymentIntent): Promise<void> {
+    const paymentId = paymentIntent.metadata.paymentId;
+    if (!paymentId) return;
+
+    await this.prisma.$transaction(async (tx) => {
+      // Update payment status
+      await tx.payment.update({
+        where: { id: paymentId },
+        data: {
+          status: PaymentStatus.FAILED,
+          gatewayResponse: {
+            stripePaymentIntentId: paymentIntent.id,
+            stripeStatus: paymentIntent.status,
+            stripeError: paymentIntent.last_payment_error?.message,
+            stripeErrorCode: paymentIntent.last_payment_error?.code
+          }
+        }
+      });
+
+      // Update order status
+      const payment = await tx.payment.findUnique({
+        where: { id: paymentId }
+      });
+
+      if (payment) {
+        await tx.order.update({
+          where: { id: payment.orderId },
+          data: {
+            paymentStatus: PaymentStatus.FAILED
+          }
+        });
+
+        // Release inventory reservations
+        await this.releaseOrderInventory(tx, payment.orderId);
+      }
+    });
+
+    this.logger.info({ paymentId, paymentIntentId: paymentIntent.id }, 'Payment intent failed webhook processed');
+  }
+
+  private async handleChargeRefunded(charge: Stripe.Charge): Promise<void> {
+    if (!charge.payment_intent || typeof charge.payment_intent !== 'string') return;
+
+    const payment = await this.paymentRepo.findFirst({
+      where: { transactionId: charge.payment_intent }
+    });
+
+    if (payment) {
+      // Update refund status
+      const refundAmount = (charge.amount_refunded / 100); // Convert from cents
+      
+      await this.prisma.$transaction(async (tx) => {
+        // Find or create refund record
+        const existingRefund = await tx.refund.findFirst({
+          where: {
+            paymentId: payment.id,
+            status: 'PENDING'
+          }
+        });
+
+        if (existingRefund) {
+          await tx.refund.update({
+            where: { id: existingRefund.id },
+            data: {
+              status: 'PROCESSED',
+              processedAt: new Date()
+              // transactionId and completedAt fields don't exist in Refund model
+            }
+          });
+        }
+
+        // Update payment refund amount
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: {
+            // refundedAmount field doesn't exist in Payment model
+            status: refundAmount >= parseFloat(payment.amount.toString()) ? PaymentStatus.REFUNDED : PaymentStatus.PAID
+          }
+        });
+
+        // Update order if fully refunded
+        if (refundAmount >= parseFloat(payment.amount.toString())) {
+          await tx.order.update({
+            where: { id: payment.orderId },
+            data: {
+              status: 'CANCELLED',
+              paymentStatus: PaymentStatus.REFUNDED
+            }
+          });
+        }
+      });
+
+      this.logger.info({ paymentId: payment.id, chargeId: charge.id }, 'Charge refunded webhook processed');
+    }
+  }
+
+  private async handleDisputeCreated(dispute: Stripe.Dispute): Promise<void> {
+    const paymentIntentId = dispute.payment_intent as string;
+    
+    const payment = await this.paymentRepo.findFirst({
+      where: { transactionId: paymentIntentId }
+    });
+
+    if (payment) {
+      await this.prisma.$transaction(async (tx) => {
+        // Update payment with dispute info
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: PaymentStatus.FAILED, // Using FAILED for disputed payments
+            gatewayResponse: {
+              ...payment.gatewayResponse as any,
+              disputeId: dispute.id,
+              disputeStatus: dispute.status,
+              disputeReason: dispute.reason,
+              disputeAmount: dispute.amount / 100
+            }
+          }
+        });
+
+        // Create notification for admin users
+        // Find admin users (those with admin role)
+        const adminUsers = await tx.user.findMany({
+          where: { role: 'ADMIN' },
+          select: { id: true }
+        });
+        
+        // Create notifications for all admin users
+        for (const admin of adminUsers) {
+          await tx.notification.create({
+            data: {
+              id: nanoid(),
+              userId: admin.id,
+              type: 'ORDER_UPDATE', // Using ORDER_UPDATE for payment disputes
+              title: 'Payment Dispute Created',
+              message: `A dispute has been created for payment ${payment.id}`,
+              data: {
+                paymentId: payment.id,
+                disputeId: dispute.id,
+                amount: dispute.amount / 100
+              }
+              // priority and status fields don't exist in Notification model
+            }
+          });
+        }
+      });
+
+      this.logger.warn({ paymentId: payment.id, disputeId: dispute.id }, 'Payment dispute created');
+    }
+  }
+
+  private async handlePayoutPaid(payout: Stripe.Payout): Promise<void> {
+    const payoutRecord = await this.payoutRepo.findFirst({
+      where: { reference: payout.id }
+    });
+
+    if (payoutRecord) {
+      await this.payoutRepo.update(payoutRecord.id, {
+        status: 'PAID',
+        processedAt: new Date()
+        // completedAt and gatewayResponse fields don't exist in Payout model
+      });
+
+      this.logger.info({ payoutId: payoutRecord.id, stripePayoutId: payout.id }, 'Payout paid webhook processed');
+    }
+  }
+
+  private async handlePayoutFailed(payout: Stripe.Payout): Promise<void> {
+    const payoutRecord = await this.payoutRepo.findFirst({
+      where: { reference: payout.id }
+    });
+
+    if (payoutRecord) {
+      await this.payoutRepo.update(payoutRecord.id, {
+        status: 'FAILED'
+        // gatewayResponse field doesn't exist in Payout model
+      });
+
+      this.logger.error({ payoutId: payoutRecord.id, stripePayoutId: payout.id }, 'Payout failed webhook processed');
+    }
+  }
+
+  private async createSellerCommissions(tx: any, orderId: string): Promise<void> {
+    // Get order items grouped by seller
+    const orderItems = await tx.orderItem.findMany({
+      where: { orderId },
+      include: {
+        product: {
+          select: {
+            sellerId: true
+          }
+        }
+      }
+    });
+
+    const sellerTotals = new Map<string, number>();
+    
+    // Calculate totals per seller
+    orderItems.forEach((item: any) => {
+      const sellerId = item.product.sellerId;
+      const itemTotal = parseFloat(item.subtotal.toString());
+      sellerTotals.set(sellerId, (sellerTotals.get(sellerId) || 0) + itemTotal);
+    });
+
+    // Create commission records
+    for (const [sellerId, amount] of sellerTotals) {
+      const commissionRate = 0.10; // 10% platform commission
+      const commissionAmount = amount * commissionRate;
+      const sellerAmount = amount - commissionAmount;
+
+      await tx.sellerCommission.create({
+        data: {
+          id: nanoid(),
+          sellerId,
+          orderId,
+          grossAmount: amount,
+          commissionRate,
+          commissionAmount,
+          netAmount: sellerAmount,
+          status: 'PENDING',
+          currency: 'USD' // Should come from order
+        }
+      });
+    }
+  }
+
+  private async releaseOrderInventory(tx: any, orderId: string): Promise<void> {
+    // Delete all inventory reservations for this order
+    await tx.inventory_reservations.deleteMany({
+      where: { order_id: orderId }
+    });
+
+    this.logger.info({ orderId }, 'Released inventory reservations for cancelled order');
+  }
+
+  async getPaymentAnalytics(params: {
+    sellerId?: string;
+    dateFrom: Date;
+    dateTo: Date;
+    groupBy?: 'day' | 'week' | 'month';
+  }): Promise<ServiceResult<{
+    totalRevenue: number;
+    totalTransactions: number;
+    averageTransactionValue: number;
+    paymentMethodBreakdown: Record<string, { count: number; amount: number }>;
+    statusBreakdown: Record<string, number>;
+    dailyRevenue: Array<{ date: string; amount: number; count: number }>;
+    topProducts: Array<{ productId: string; productName: string; revenue: number; quantity: number }>;
+  }>> {
+    try {
+      const where: Prisma.PaymentWhereInput = {
+        createdAt: {
+          gte: params.dateFrom,
+          lte: params.dateTo
+        }
+      };
+
+      if (params.sellerId) {
+        where.order = {
+          items: {
+            some: {
+              product: {
+                sellerId: params.sellerId
+              }
+            }
+          }
+        };
+      }
+
+      // Get payment aggregations
+      const [
+        totalStats,
+        methodBreakdown,
+        statusBreakdown,
+        dailyStats
+      ] = await Promise.all([
+        // Total statistics
+        this.prisma.payment.aggregate({
+          where: { ...where, status: PaymentStatus.PAID },
+          _sum: { amount: true },
+          _count: true,
+          _avg: { amount: true }
+        }),
+        // Payment method breakdown
+        this.prisma.payment.groupBy({
+          by: ['method'],
+          where: { ...where, status: PaymentStatus.PAID },
+          _sum: { amount: true },
+          _count: true
+        }),
+        // Status breakdown
+        this.prisma.payment.groupBy({
+          by: ['status'],
+          where,
+          _count: true
+        }),
+        // Daily revenue
+        this.prisma.$queryRaw<Array<{ date: Date; amount: number; count: bigint }>>`
+          SELECT 
+            DATE(created_at) as date,
+            SUM(amount) as amount,
+            COUNT(*) as count
+          FROM payment
+          WHERE created_at >= ${params.dateFrom}
+            AND created_at <= ${params.dateTo}
+            AND status = ${PaymentStatus.PAID}
+            ${params.sellerId ? Prisma.sql`AND order_id IN (
+              SELECT DISTINCT order_id 
+              FROM order_item oi
+              JOIN product p ON oi.product_id = p.id
+              WHERE p.seller_id = ${params.sellerId}
+            )` : Prisma.empty}
+          GROUP BY DATE(created_at)
+          ORDER BY date ASC
+        `
+      ]);
+
+      // Get top products
+      const topProducts = await this.prisma.$queryRaw<Array<{ 
+        product_id: string; 
+        product_name: string; 
+        revenue: number; 
+        quantity: bigint 
+      }>>`
+        SELECT 
+          oi.product_id,
+          p.name as product_name,
+          SUM(oi.subtotal) as revenue,
+          SUM(oi.quantity) as quantity
+        FROM order_item oi
+        JOIN product p ON oi.product_id = p.id
+        JOIN "order" o ON oi.order_id = o.id
+        JOIN payment pay ON o.id = pay.order_id
+        WHERE pay.created_at >= ${params.dateFrom}
+          AND pay.created_at <= ${params.dateTo}
+          AND pay.status = ${PaymentStatus.PAID}
+          ${params.sellerId ? Prisma.sql`AND p.seller_id = ${params.sellerId}` : Prisma.empty}
+        GROUP BY oi.product_id, p.name
+        ORDER BY revenue DESC
+        LIMIT 10
+      `;
+
+      // Format results
+      const paymentMethodBreakdown: Record<string, { count: number; amount: number }> = {};
+      methodBreakdown.forEach(item => {
+        paymentMethodBreakdown[item.method] = {
+          count: item._count,
+          amount: parseFloat(item._sum.amount?.toString() || '0')
+        };
+      });
+
+      const statusBreakdownFormatted: Record<string, number> = {};
+      statusBreakdown.forEach(item => {
+        statusBreakdownFormatted[item.status] = item._count;
+      });
+
+      return {
+        success: true,
+        data: {
+          totalRevenue: parseFloat(totalStats._sum.amount?.toString() || '0'),
+          totalTransactions: totalStats._count,
+          averageTransactionValue: parseFloat(totalStats._avg.amount?.toString() || '0'),
+          paymentMethodBreakdown,
+          statusBreakdown: statusBreakdownFormatted,
+          dailyRevenue: dailyStats.map(day => ({
+            date: day.date.toISOString().split('T')[0],
+            amount: parseFloat(day.amount.toString()),
+            count: Number(day.count)
+          })),
+          topProducts: topProducts.map(product => ({
+            productId: product.product_id,
+            productName: product.product_name,
+            revenue: parseFloat(product.revenue.toString()),
+            quantity: Number(product.quantity)
+          }))
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error, params }, 'Failed to get payment analytics');
+      return {
+        success: false,
+        error: new ApiError('Failed to get payment analytics', 500, 'ANALYTICS_ERROR')
+      };
+    }
   }
 }

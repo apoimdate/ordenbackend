@@ -7,7 +7,10 @@ import { ApiError } from '../utils/errors';
 // import { uploadToS3, deleteFromS3, generateImageVariants } from '../utils/storage';
 import { updateSearchIndex, removeFromSearchIndex } from '../utils/search';
 import { searchProducts } from '../utils/search';
-import { ProductRepository, ProductImageRepository } from '../repositories';
+import { 
+  ProductRepository, 
+  ProductImageRepository
+} from '../repositories';
 
 interface CreateProductData {
   sellerId: string;
@@ -555,4 +558,508 @@ export class ProductService extends CrudService<Product, any, any> {
       };
     }
   }
+
+  // PRODUCTION: Review Aggregation & Analytics
+
+  async getProductReviews(productId: string, options: {
+    page?: number;
+    limit?: number;
+    rating?: number; // Filter by specific rating
+    verified?: boolean; // Filter by verified reviews
+    sortBy?: 'newest' | 'oldest' | 'rating_high' | 'rating_low' | 'helpful';
+  } = {}): Promise<ServiceResult<{
+    reviews: Array<{
+      id: string;
+      userId: string;
+      userName: string;
+      rating: number;
+      title?: string;
+      comment: string;
+      isVerified: boolean;
+      status: string;
+      createdAt: Date;
+      helpfulCount: number;
+      images?: string[];
+    }>;
+    meta: {
+      total: number;
+      page: number;
+      limit: number;
+      totalPages: number;
+    };
+    summary: {
+      averageRating: number;
+      totalReviews: number;
+      ratingDistribution: Record<number, number>;
+      verifiedPercentage: number;
+    };
+  }>> {
+    try {
+      const product = await this.productRepo.findById(productId);
+      if (!product) {
+        return {
+          success: false,
+          error: new ApiError('Product not found', 404, 'PRODUCT_NOT_FOUND')
+        };
+      }
+
+      // Build review filters
+      const where: Prisma.ReviewWhereInput = {
+        productId,
+        status: 'APPROVED' // Only show approved reviews
+      };
+
+      if (options.rating !== undefined) {
+        where.rating = options.rating;
+      }
+
+      if (options.verified !== undefined) {
+        where.isVerified = options.verified;
+      }
+
+      // Build sort order
+      let orderBy: Prisma.ReviewOrderByWithRelationInput = { createdAt: 'desc' };
+      switch (options.sortBy) {
+        case 'oldest':
+          orderBy = { createdAt: 'asc' };
+          break;
+        case 'rating_high':
+          orderBy = { rating: 'desc' };
+          break;
+        case 'rating_low':
+          orderBy = { rating: 'asc' };
+          break;
+        case 'helpful':
+          // Fallback to newest since helpfulness not in schema
+          orderBy = { createdAt: 'desc' };
+          break;
+      }
+
+      const page = options.page || 1;
+      const limit = options.limit || 20;
+      const skip = (page - 1) * limit;
+
+      // Get reviews with user info
+      const [reviews, total, allReviews] = await Promise.all([
+        this.prisma.review.findMany({
+          where,
+          include: {
+            user: {
+              select: {
+                firstName: true,
+                lastName: true
+              }
+            },
+            // Remove _count as it's not available in the current schema
+          },
+          orderBy,
+          skip,
+          take: limit
+        }),
+        this.prisma.review.count({ where }),
+        // Get all reviews for summary stats
+        this.prisma.review.findMany({
+          where: { productId, status: 'APPROVED' },
+          select: {
+            rating: true,
+            isVerified: true
+          }
+        })
+      ]);
+
+      // Calculate summary statistics
+      const totalReviews = allReviews.length;
+      const averageRating = totalReviews > 0 
+        ? allReviews.reduce((sum, r) => sum + r.rating, 0) / totalReviews
+        : 0;
+
+      const ratingDistribution: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      let verifiedCount = 0;
+
+      allReviews.forEach(review => {
+        ratingDistribution[review.rating] = (ratingDistribution[review.rating] || 0) + 1;
+        if (review.isVerified) verifiedCount++;
+      });
+
+      const verifiedPercentage = totalReviews > 0 ? (verifiedCount / totalReviews) * 100 : 0;
+
+      // Format review data
+      const formattedReviews = reviews.map(review => ({
+        id: review.id,
+        userId: review.userId,
+        userName: review.user?.firstName && review.user?.lastName 
+          ? `${review.user.firstName} ${review.user.lastName}`
+          : 'Anonymous',
+        rating: review.rating,
+        title: review.title || undefined,
+        comment: review.comment,
+        isVerified: review.isVerified,
+        status: review.status as string,
+        createdAt: review.createdAt,
+        helpfulCount: 0, // Placeholder since votes not in current schema
+        images: [] // Add if you have review images
+      }));
+
+      return {
+        success: true,
+        data: {
+          reviews: formattedReviews,
+          meta: {
+            total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit)
+          },
+          summary: {
+            averageRating: Math.round(averageRating * 100) / 100,
+            totalReviews,
+            ratingDistribution,
+            verifiedPercentage: Math.round(verifiedPercentage * 100) / 100
+          }
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error, productId }, 'Failed to get product reviews');
+      return {
+        success: false,
+        error: new ApiError('Failed to get product reviews', 500, 'REVIEWS_ERROR')
+      };
+    }
+  }
+
+  async getProductReviewSummary(productId: string): Promise<ServiceResult<{
+    averageRating: number;
+    totalReviews: number;
+    ratingDistribution: Record<number, number>;
+    verifiedPercentage: number;
+    recentTrend: {
+      last30Days: number;
+      previousPeriod: number;
+      trendPercentage: number;
+    };
+    qualityMetrics: {
+      averageVerifiedRating: number;
+      averageUnverifiedRating: number;
+      detailedReviewsPercentage: number; // Reviews with >50 characters
+    };
+  }>> {
+    try {
+      const product = await this.productRepo.findById(productId);
+      if (!product) {
+        return {
+          success: false,
+          error: new ApiError('Product not found', 404, 'PRODUCT_NOT_FOUND')
+        };
+      }
+
+      // Get all approved reviews
+      const allReviews = await this.prisma.review.findMany({
+        where: {
+          productId,
+          status: 'APPROVED'
+        },
+        select: {
+          rating: true,
+          comment: true,
+          isVerified: true,
+          createdAt: true
+        }
+      });
+
+      const totalReviews = allReviews.length;
+
+      if (totalReviews === 0) {
+        return {
+          success: true,
+          data: {
+            averageRating: 0,
+            totalReviews: 0,
+            ratingDistribution: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
+            verifiedPercentage: 0,
+            recentTrend: {
+              last30Days: 0,
+              previousPeriod: 0,
+              trendPercentage: 0
+            },
+            qualityMetrics: {
+              averageVerifiedRating: 0,
+              averageUnverifiedRating: 0,
+              detailedReviewsPercentage: 0
+            }
+          }
+        };
+      }
+
+      // Calculate basic metrics
+      const averageRating = allReviews.reduce((sum, r) => sum + r.rating, 0) / totalReviews;
+      
+      const ratingDistribution: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      let verifiedCount = 0;
+      let verifiedRatingSum = 0;
+      let unverifiedRatingSum = 0;
+      let unverifiedCount = 0;
+      let detailedReviewsCount = 0;
+
+      allReviews.forEach(review => {
+        ratingDistribution[review.rating] = (ratingDistribution[review.rating] || 0) + 1;
+        
+        if (review.isVerified) {
+          verifiedCount++;
+          verifiedRatingSum += review.rating;
+        } else {
+          unverifiedCount++;
+          unverifiedRatingSum += review.rating;
+        }
+
+        if (review.comment && review.comment.length > 50) {
+          detailedReviewsCount++;
+        }
+      });
+
+      // Calculate trend (last 30 days vs previous 30 days)
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+      
+      const sixtyDaysAgo = new Date();
+      sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+
+      const last30DaysReviews = allReviews.filter(r => r.createdAt >= thirtyDaysAgo).length;
+      const previousPeriodReviews = allReviews.filter(r => 
+        r.createdAt >= sixtyDaysAgo && r.createdAt < thirtyDaysAgo
+      ).length;
+
+      const trendPercentage = previousPeriodReviews > 0 
+        ? ((last30DaysReviews - previousPeriodReviews) / previousPeriodReviews) * 100
+        : last30DaysReviews > 0 ? 100 : 0;
+
+      return {
+        success: true,
+        data: {
+          averageRating: Math.round(averageRating * 100) / 100,
+          totalReviews,
+          ratingDistribution,
+          verifiedPercentage: Math.round((verifiedCount / totalReviews) * 10000) / 100,
+          recentTrend: {
+            last30Days: last30DaysReviews,
+            previousPeriod: previousPeriodReviews,
+            trendPercentage: Math.round(trendPercentage * 100) / 100
+          },
+          qualityMetrics: {
+            averageVerifiedRating: verifiedCount > 0 
+              ? Math.round((verifiedRatingSum / verifiedCount) * 100) / 100 
+              : 0,
+            averageUnverifiedRating: unverifiedCount > 0 
+              ? Math.round((unverifiedRatingSum / unverifiedCount) * 100) / 100 
+              : 0,
+            detailedReviewsPercentage: Math.round((detailedReviewsCount / totalReviews) * 10000) / 100
+          }
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error, productId }, 'Failed to get product review summary');
+      return {
+        success: false,
+        error: new ApiError('Failed to get review summary', 500, 'REVIEW_SUMMARY_ERROR')
+      };
+    }
+  }
+
+  async getProductsWithReviewStats(options: {
+    sellerId?: string;
+    categoryId?: string;
+    minRating?: number;
+    minReviews?: number;
+    sortBy?: 'rating' | 'review_count' | 'recent_reviews';
+    page?: number;
+    limit?: number;
+  } = {}): Promise<ServiceResult<PaginatedResult<{
+    id: string;
+    name: string;
+    price: number;
+    averageRating: number;
+    totalReviews: number;
+    verifiedReviews: number;
+    recentReviews: number; // last 30 days
+    ratingTrend: number; // percentage change in rating
+  }>>> {
+    try {
+      // Build product filters
+      const where: Prisma.ProductWhereInput = {
+        status: 'PUBLISHED'
+      };
+
+      if (options.sellerId) {
+        where.sellerId = options.sellerId;
+      }
+
+      if (options.categoryId) {
+        where.categoryId = options.categoryId;
+      }
+
+      // Get products with review aggregations
+      const page = options.page || 1;
+      const limit = options.limit || 20;
+      const skip = (page - 1) * limit;
+
+      const products = await this.prisma.product.findMany({
+        where,
+        include: {
+          reviews: {
+            where: { status: 'APPROVED' },
+            select: {
+              rating: true,
+              isVerified: true,
+              createdAt: true
+            }
+          }
+        },
+        skip,
+        take: limit
+      });
+
+      const total = await this.prisma.product.count({ where });
+
+      // Process review statistics
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+      const sixtyDaysAgo = new Date();
+      sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+
+      const productsWithStats = products
+        .map(product => {
+          const reviews = product.reviews;
+          const totalReviews = reviews.length;
+          
+          if (totalReviews === 0) {
+            return {
+              id: product.id,
+              name: product.name,
+              price: parseFloat(product.price.toString()),
+              averageRating: 0,
+              totalReviews: 0,
+              verifiedReviews: 0,
+              recentReviews: 0,
+              ratingTrend: 0
+            };
+          }
+
+          const averageRating = reviews.reduce((sum, r) => sum + r.rating, 0) / totalReviews;
+          const verifiedReviews = reviews.filter(r => r.isVerified).length;
+          const recentReviews = reviews.filter(r => r.createdAt >= thirtyDaysAgo).length;
+
+          // Calculate rating trend (recent vs previous period)
+          const recentRatings = reviews.filter(r => r.createdAt >= thirtyDaysAgo);
+          const previousRatings = reviews.filter(r => 
+            r.createdAt >= sixtyDaysAgo && r.createdAt < thirtyDaysAgo
+          );
+
+          let ratingTrend = 0;
+          if (recentRatings.length > 0 && previousRatings.length > 0) {
+            const recentAvg = recentRatings.reduce((sum, r) => sum + r.rating, 0) / recentRatings.length;
+            const previousAvg = previousRatings.reduce((sum, r) => sum + r.rating, 0) / previousRatings.length;
+            ratingTrend = ((recentAvg - previousAvg) / previousAvg) * 100;
+          }
+
+          return {
+            id: product.id,
+            name: product.name,
+            price: parseFloat(product.price.toString()),
+            averageRating: Math.round(averageRating * 100) / 100,
+            totalReviews,
+            verifiedReviews,
+            recentReviews,
+            ratingTrend: Math.round(ratingTrend * 100) / 100
+          };
+        })
+        .filter(product => {
+          // Apply post-aggregation filters
+          if (options.minRating && product.averageRating < options.minRating) {
+            return false;
+          }
+          if (options.minReviews && product.totalReviews < options.minReviews) {
+            return false;
+          }
+          return true;
+        });
+
+      // Apply sorting
+      if (options.sortBy) {
+        productsWithStats.sort((a, b) => {
+          switch (options.sortBy) {
+            case 'rating':
+              return b.averageRating - a.averageRating;
+            case 'review_count':
+              return b.totalReviews - a.totalReviews;
+            case 'recent_reviews':
+              return b.recentReviews - a.recentReviews;
+            default:
+              return 0;
+          }
+        });
+      }
+
+      return {
+        success: true,
+        data: {
+          data: productsWithStats,
+          meta: {
+            total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit)
+          }
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error, options }, 'Failed to get products with review stats');
+      return {
+        success: false,
+        error: new ApiError('Failed to get products with review stats', 500, 'PRODUCT_STATS_ERROR')
+      };
+    }
+  }
+
+  async updateProductRatingCache(productId: string): Promise<ServiceResult<{
+    averageRating: number;
+    totalReviews: number;
+  }>> {
+    try {
+      const reviews = await this.prisma.review.findMany({
+        where: {
+          productId,
+          status: 'APPROVED'
+        },
+        select: { rating: true }
+      });
+
+      const totalReviews = reviews.length;
+      const averageRating = totalReviews > 0 
+        ? reviews.reduce((sum, r) => sum + r.rating, 0) / totalReviews
+        : 0;
+
+      // Cache the results for quick access
+      const cacheKey = `product:${productId}:rating_summary`;
+      await cache.set(cacheKey, {
+        averageRating: Math.round(averageRating * 100) / 100,
+        totalReviews,
+        lastUpdated: new Date()
+      }, { ttl: 3600 }); // Cache for 1 hour
+
+      return {
+        success: true,
+        data: {
+          averageRating: Math.round(averageRating * 100) / 100,
+          totalReviews
+        }
+      };
+    } catch (error) {
+      this.logger.error({ error, productId }, 'Failed to update product rating cache');
+      return {
+        success: false,
+        error: new ApiError('Failed to update rating cache', 500, 'CACHE_UPDATE_ERROR')
+      };
+    }
+  }
+
 }
